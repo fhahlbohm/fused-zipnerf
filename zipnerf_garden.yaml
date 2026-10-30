@@ -1,0 +1,102 @@
+GLOBAL:
+    LOG_LEVEL: 2
+    GPU_INDICES:
+    - 0
+    RANDOM_SEED: 0
+    ANOMALY_DETECTION: false
+    FILTER_WARNINGS: true
+    METHOD_TYPE: ZipNeRF
+    DATASET_TYPE: MipNeRF360
+MODEL:
+    N_SAMPLES: [64, 64, 32]  # samples per ray for the two proposal levels and the NeRF level
+    RAYDIST_POWER: -1.5  # power ladder curve that spaces the samples along the rays (must not be 0 or 1)
+    RAYDIST_PREMULT: 2.0
+    HASHGRID_N_LEVELS: [6, 8, 10]  # resolution levels of the hash grid of each sampling level
+    HASHGRID_N_FEATURES_PER_LEVEL: [1, 1, 4]
+    HASHGRID_LOG2_HASHMAP_SIZE: 21
+    HASHGRID_BASE_RESOLUTION: 16
+    HASHGRID_PER_LEVEL_SCALE: 2.0
+    MLP_DENSITY_WIDTH: 64  # hidden width of the density MLPs of all levels
+    MLP_BOTTLENECK_WIDTH: 256
+    MLP_VIEW_WIDTH: 256  # width of the three view-dependent layers of the NeRF MLP
+    DIRECTION_ENCODING_DEGREE: 4
+RENDERER:
+    RAY_BATCH_SIZE: 65_536  # rays per inference batch
+    RENDER_EXTRAS: false  # if true, inference also outputs the opacity and the depth
+TRAINING:
+    LOAD_CHECKPOINT: null
+    MODEL_NAME: zipnerf_garden
+    NUM_ITERATIONS: 25_000
+    RUN_VALIDATION: false
+    DATA:
+        PRELOADING_LEVEL: 1
+        FIELDS: ['rgb']
+        PRECOMPUTE_RAYS: false
+        RAYS_TO_DEVICE: true
+    BACKUP:
+        FINAL_CHECKPOINT: true
+        RENDER_TESTSET: true
+        RENDER_TRAINSET: false
+        RENDER_VALSET: false
+        INTERMEDIATE_RENDERINGS: true
+        VISUALIZE_ERRORS: false
+        INTERVAL: -1
+        TRAINING_STATE: false
+    TIMING:
+        ACTIVATE: true
+        INCLUDE_DATALOADING_IN_TOTAL: true
+        INCLUDE_PRETRAINING_IN_TOTAL: true
+        INCLUDE_POSTTRAINING_IN_TOTAL: false
+    WANDB:
+        ACTIVATE: false
+        ENTITY: null
+        PROJECT: nerficg
+        LOG_IMAGES: true
+        INDEX_VALIDATION: -1
+        INDEX_TRAINING: -1
+        INTERVAL: 1000
+        SWEEP_MODE:
+            ACTIVE: false
+            START_ITERATION: 999
+            ITERATION_STRIDE: 1000
+            NUM_IMAGES: -1
+    WRITE_VRAM_STATS: true
+    GUI:
+        ACTIVATE: false
+        RENDER_INTERVAL: 5
+        GUI_STATUS_ENABLED: true
+        GUI_STATUS_INTERVAL: 20
+        SKIP_GUI_SETUP: false
+        FPS_ROLLING_AVERAGE_SIZE: 100
+        MAX_RENDERS_BETWEEN_GUI_UPDATES: 2
+    BATCH_SIZE: 65_536  # paper setting; the official single-GPU config uses 8192 rays, 200k iterations, and 8x lower learning rates
+    ANNEAL_SLOPE: 10.0  # slope of the annealing of the proposal weights used for resampling
+    LEARNING_RATE:
+        INIT: 0.01
+        FINAL: 0.001
+        DELAY_STEPS: 2_500
+        DELAY_MULT: 1.0e-08
+    LOSS:
+        CHARBONNIER_PADDING: 0.001
+        LAMBDA_INTERLEVEL: 0.01
+        INTERLEVEL_BLURS:
+        - 0.03
+        - 0.003
+        LAMBDA_DISTORTION: 0.01
+        DISTORTION_POWER: -0.25
+        DISTORTION_PREMULT: 10_000.0
+        LAMBDA_GRID_REGULARIZATION: 0.1
+DATASET:
+    PATH: dataset/mipnerf360/garden
+    IMAGE_SCALE_FACTOR: 0.25
+    NORMALIZE_CUBE: null
+    NORMALIZE_RECENTER: false
+    BACKGROUND_COLOR:  # used for rendering, training uses random background colors
+    - 0.5
+    - 0.5
+    - 0.5
+    NEAR_PLANE: 1.0e-06  # official code uses 0.0
+    FAR_PLANE: 1.0e+06
+    TEST_STEP: 8
+    APPLY_PCA: true
+    APPLY_PCA_RESCALE: true  # fits camera positions to [-1, 1]^3 as in the official code
