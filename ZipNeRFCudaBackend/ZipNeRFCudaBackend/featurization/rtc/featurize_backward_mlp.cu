@@ -77,7 +77,7 @@ extern "C" __global__ void __launch_bounds__(JIT_BLOCK_SIZE) featurize_backward_
             #pragma unroll
             for (uint32_t i = 0; i < n_output_features; i++) grad_f[i] *= feature_scale;
             const RayInterval interval = setup_interval(origins, directions, radii, tdist, pattern_seed, sample_idx, n_intervals);
-            scatter_feature_gradients(interval, grad_f, grad_table);
+            scatter_feature_gradients<JIT_N_LEVELS>(interval, grad_f, grad_table, nullptr);
         }
         __syncthreads();
         #pragma unroll

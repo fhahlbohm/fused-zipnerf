@@ -6,9 +6,10 @@
 
 namespace zipnerf::optimizer {
 
-    // Adam of several flat buffers in one launch per step; gradients are unscaled, nan_to_num-ed, and zeroed after the
-    // update; buffers with level offsets are hash grid tables, whose levels get the regularizer 0.5 * reg_weight *
-    // mean(p^2), and the last block writes the scale feature magnitudes sqrt(max_value^2 + mean(p^2)) and the regularizer
+    // Adam of several flat buffers in one launch per step; gradients (fp32, or fp16 clamped to the fp16 range so that an
+    // overflow cannot reach the moments) are unscaled, nan_to_num-ed, and zeroed after the update; buffers with level
+    // offsets are hash grid tables, whose levels get the regularizer 0.5 * reg_weight * mean(p^2), and the last block
+    // writes the scale feature magnitudes sqrt(max_value^2 + mean(p^2)) and the regularizer
     class Adam {
     public:
         Adam(

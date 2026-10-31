@@ -4,7 +4,7 @@
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAStream.h>
 #include <cublasLt.h>
-#include <cuda_fp16.h>
+#include <cuda_bf16.h>
 
 #include <cmath>
 #include <stdexcept>
@@ -28,7 +28,7 @@ namespace zipnerf::mlp {
 
     struct Epilogue {
         cublasLtEpilogue_t type = CUBLASLT_EPILOGUE_DEFAULT;
-        const void* bias = nullptr;  // fp16 bias, or fp16 bias gradient output for bgrad epilogues (cuBLASLt requires the output type)
+        const void* bias = nullptr;  // bf16 bias, or bf16 bias gradient output for bgrad epilogues (cuBLASLt requires the output type)
         void* aux = nullptr;  // relu bitmask
         int64_t aux_ld = 0;
     };
@@ -183,14 +183,14 @@ namespace zipnerf::mlp {
         return sum;
     }
 
-    __global__ void pack_kernel(const float* __restrict__ params, const Layout layout, __half* __restrict__ packed) {
+    __global__ void pack_kernel(const float* __restrict__ params, const Layout layout, __nv_bfloat16* __restrict__ packed) {
         const int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
         if (idx >= layout.weights[n_weights]) return;
         const int weight = find_segment(layout.weights, n_weights, idx);
         const int64_t element = idx - layout.weights[weight], cols = weight_cols(weight, layout);
         // alignment padding between the segments
         if (element >= weight_rows(weight, layout) * cols) {
-            packed[idx] = __float2half(0.0f);
+            packed[idx] = __float2bfloat16(0.0f);
             return;
         }
         const int64_t row = element / cols, column = element % cols;
@@ -230,13 +230,13 @@ namespace zipnerf::mlp {
             case w_rgb: if (row >= 1 && row < 4) value = params[layout.params[rgb_weight] + (row - 1) * layout.n_rgb_inputs + column]; break;
             default: __trap();
         }
-        packed[idx] = __float2half(value);
+        packed[idx] = __float2bfloat16(value);
     }
 
     __global__ void unpack_kernel(
         const float* __restrict__ params,
         const float* __restrict__ weight_grads,
-        const __half* __restrict__ bias_grads,
+        const __nv_bfloat16* __restrict__ bias_grads,
         const Layout layout,
         float* __restrict__ grad_params)
     {
@@ -254,7 +254,7 @@ namespace zipnerf::mlp {
         float grad = 0.0f;
         switch (parameter) {
             case density_0_weight: grad = weight_grads[layout.weights[w_density] + element]; break;
-            case density_0_bias: grad = __half2float(bias_grads[layout.bias_grads[b_density] + element]); break;
+            case density_0_bias: grad = __bfloat162float(bias_grads[layout.bias_grads[b_density] + element]); break;
             case density_1_weight: grad = grad_skip[element]; break;
             case density_1_bias: grad = grad_skip[bias_column]; break;
             case bottleneck_weight: grad = unfold_bottleneck(view_0, rgb, grad_combined, grad_skip, element / layout.density_width, element % layout.density_width, layout); break;
@@ -267,9 +267,9 @@ namespace zipnerf::mlp {
             }
             case view_0_bias: grad = grad_combined[element * layout.n_inputs + bias_column]; break;
             case view_1_weight: grad = weight_grads[layout.weights[w_1] + element]; break;
-            case view_1_bias: grad = __half2float(bias_grads[layout.bias_grads[b_1] + element]); break;
+            case view_1_bias: grad = __bfloat162float(bias_grads[layout.bias_grads[b_1] + element]); break;
             case view_2_weight: grad = weight_grads[layout.weights[w_2] + element]; break;
-            case view_2_bias: grad = __half2float(bias_grads[layout.bias_grads[b_2] + element]); break;
+            case view_2_bias: grad = __bfloat162float(bias_grads[layout.bias_grads[b_2] + element]); break;
             case rgb_weight: {
                 const int64_t row = element / layout.n_rgb_inputs, column = element % layout.n_rgb_inputs;
                 const float* grad_skip_row = grad_skip + (row + 1) * layout.n_inputs;
@@ -292,7 +292,7 @@ namespace zipnerf::mlp {
     // a row-major (rows x cols, row stride) tensor seen as its column-major transpose
     static Operand operand(const torch::Tensor& tensor) {
         if (tensor.dim() != 2 || tensor.stride(1) != 1) throw std::runtime_error("ZipNeRF: matmul operands must be row-major 2D tensors");
-        return {tensor.data_ptr(), tensor.size(1), tensor.size(0), tensor.stride(0), tensor.scalar_type() == torch::kHalf ? CUDA_R_16F : CUDA_R_32F};
+        return {tensor.data_ptr(), tensor.size(1), tensor.size(0), tensor.stride(0), tensor.scalar_type() == torch::kBFloat16 ? CUDA_R_16BF : CUDA_R_32F};
     }
 
     // relu bitmask for rows x n (column-major), leading dimension rounded up to 128 bits
@@ -352,14 +352,14 @@ namespace zipnerf::mlp {
     // the column-major (in x out) view of a packed row-major (out x in) weight, so that op T yields the weight
     static Operand weight(const torch::Tensor& packed, const Layout& layout, const int w) {
         const int64_t cols = weight_cols(w, layout);
-        return {static_cast<const __half*>(packed.data_ptr()) + layout.weights[w], cols, weight_rows(w, layout), cols, CUDA_R_16F};
+        return {static_cast<const __nv_bfloat16*>(packed.data_ptr()) + layout.weights[w], cols, weight_rows(w, layout), cols, CUDA_R_16BF};
     }
     torch::Tensor NerfMlp::pack(const torch::Tensor& params) const {
         check_input(params, "params", torch::kFloat);
         if (params.numel() < m_layout.params[n_parameters]) throw std::runtime_error("ZipNeRF: invalid nerf mlp parameters");
-        torch::Tensor packed = torch::empty({m_layout.weights[n_weights]}, params.options().dtype(torch::kHalf));
+        torch::Tensor packed = torch::empty({m_layout.weights[n_weights]}, params.options().dtype(torch::kBFloat16));
         pack_kernel<<<n_blocks(m_layout.weights[n_weights]), block_size, 0, c10::cuda::getCurrentCUDAStream()>>>(
-            params.data_ptr<float>(), m_layout, reinterpret_cast<__half*>(packed.data_ptr<torch::Half>()));
+            params.data_ptr<float>(), m_layout, reinterpret_cast<__nv_bfloat16*>(packed.data_ptr<torch::BFloat16>()));
         C10_CUDA_KERNEL_LAUNCH_CHECK();
         return packed;
     }
@@ -374,10 +374,10 @@ namespace zipnerf::mlp {
             throw std::runtime_error("ZipNeRF: invalid nerf mlp inputs");
         }
         const int64_t n = features.size(0);
-        const torch::TensorOptions half = features.options();
-        const __half* packed_data = static_cast<const __half*>(packed.data_ptr());
-        torch::Tensor v0 = torch::empty({n, m_layout.view_width}, half), v1 = torch::empty({n, m_layout.view_width}, half), v2 = torch::empty({n, m_layout.view_width}, half);
-        torch::Tensor outputs = torch::empty({n, n_outputs}, half);
+        const torch::TensorOptions bf16 = features.options();
+        const __nv_bfloat16* packed_data = static_cast<const __nv_bfloat16*>(packed.data_ptr());
+        torch::Tensor v0 = torch::empty({n, m_layout.view_width}, bf16), v1 = torch::empty({n, m_layout.view_width}, bf16), v2 = torch::empty({n, m_layout.view_width}, bf16);
+        torch::Tensor outputs = torch::empty({n, n_outputs}, bf16);
         std::vector<torch::Tensor> masks;
         for (const int64_t rows : {m_layout.density_width, m_layout.view_width, m_layout.view_width, m_layout.view_width}) masks.push_back(training ? relu_mask(rows, n) : torch::Tensor());
         const auto relu = [&](const int bias, const int mask) {
@@ -390,12 +390,12 @@ namespace zipnerf::mlp {
             }
             return epilogue;
         };
-        matmul(weight(packed, m_layout, w_density), true, operand(features), false, inputs.data_ptr(), m_layout.n_inputs, CUDA_R_16F, 0.0f, relu(b_density, 0));
-        matmul(weight(packed, m_layout, w_combined), true, operand(inputs), false, v0.data_ptr(), m_layout.view_width, CUDA_R_16F, 0.0f, relu(-1, 1));
-        matmul(weight(packed, m_layout, w_skip), true, operand(inputs), false, outputs.data_ptr(), n_outputs, CUDA_R_16F, 0.0f);
-        matmul(weight(packed, m_layout, w_1), true, operand(v0), false, v1.data_ptr(), m_layout.view_width, CUDA_R_16F, 0.0f, relu(b_1, 2));
-        matmul(weight(packed, m_layout, w_2), true, operand(v1), false, v2.data_ptr(), m_layout.view_width, CUDA_R_16F, 0.0f, relu(b_2, 3));
-        matmul(weight(packed, m_layout, w_rgb), true, operand(v2), false, outputs.data_ptr(), n_outputs, CUDA_R_16F, 1.0f);
+        matmul(weight(packed, m_layout, w_density), true, operand(features), false, inputs.data_ptr(), m_layout.n_inputs, CUDA_R_16BF, 0.0f, relu(b_density, 0));
+        matmul(weight(packed, m_layout, w_combined), true, operand(inputs), false, v0.data_ptr(), m_layout.view_width, CUDA_R_16BF, 0.0f, relu(-1, 1));
+        matmul(weight(packed, m_layout, w_skip), true, operand(inputs), false, outputs.data_ptr(), n_outputs, CUDA_R_16BF, 0.0f);
+        matmul(weight(packed, m_layout, w_1), true, operand(v0), false, v1.data_ptr(), m_layout.view_width, CUDA_R_16BF, 0.0f, relu(b_1, 2));
+        matmul(weight(packed, m_layout, w_2), true, operand(v1), false, v2.data_ptr(), m_layout.view_width, CUDA_R_16BF, 0.0f, relu(b_2, 3));
+        matmul(weight(packed, m_layout, w_rgb), true, operand(v2), false, outputs.data_ptr(), n_outputs, CUDA_R_16BF, 1.0f);
         std::vector<torch::Tensor> context = {inputs, v0, v1, v2};
         context.insert(context.end(), masks.begin(), masks.end());
         return {outputs, context};
@@ -417,12 +417,12 @@ namespace zipnerf::mlp {
         const torch::Tensor& v1 = context[2];
         const torch::Tensor& v2 = context[3];
         const int64_t n = features.size(0);
-        const torch::TensorOptions half = features.options();
-        // weight gradients in fp32 (in the packed layout), bias gradients (reduced in fp32 by the epilogues) in fp16
-        torch::Tensor weight_grads = torch::empty({m_layout.weights[n_weights]}, half.dtype(torch::kFloat));
-        torch::Tensor bias_grads = torch::empty({m_layout.bias_grads[n_weights]}, half);
+        const torch::TensorOptions bf16 = features.options();
+        // weight gradients in fp32 (in the packed layout), bias gradients (reduced in fp32 by the epilogues) in bf16
+        torch::Tensor weight_grads = torch::empty({m_layout.weights[n_weights]}, bf16.dtype(torch::kFloat));
+        torch::Tensor bias_grads = torch::empty({m_layout.bias_grads[n_weights]}, bf16);
         float* weight_grads_data = weight_grads.data_ptr<float>();
-        __half* bias_grads_data = reinterpret_cast<__half*>(bias_grads.data_ptr<torch::Half>());
+        __nv_bfloat16* bias_grads_data = reinterpret_cast<__nv_bfloat16*>(bias_grads.data_ptr<torch::BFloat16>());
         const auto drelu = [&](const int mask, const int64_t rows, const int bias) {
             Epilogue epilogue;
             epilogue.type = bias >= 0 ? CUBLASLT_EPILOGUE_DRELU_BGRAD : CUBLASLT_EPILOGUE_DRELU;
@@ -435,23 +435,23 @@ namespace zipnerf::mlp {
         const auto weight_grad = [&](const torch::Tensor& grad_out, const torch::Tensor& in, const int w) {
             matmul(operand(in), false, operand(grad_out), true, weight_grads_data + m_layout.weights[w], weight_cols(w, m_layout), CUDA_R_32F, 0.0f);
         };
-        torch::Tensor grad_v2 = torch::empty({n, m_layout.view_width}, half), grad_v1 = torch::empty({n, m_layout.view_width}, half), grad_v0 = torch::empty({n, m_layout.view_width}, half);
-        torch::Tensor grad_hidden = torch::empty({n, m_layout.density_width}, half), grad_features = torch::empty({n, features.size(1)}, half);
+        torch::Tensor grad_v2 = torch::empty({n, m_layout.view_width}, bf16), grad_v1 = torch::empty({n, m_layout.view_width}, bf16), grad_v0 = torch::empty({n, m_layout.view_width}, bf16);
+        torch::Tensor grad_hidden = torch::empty({n, m_layout.density_width}, bf16), grad_features = torch::empty({n, features.size(1)}, bf16);
         // a weight operand with op N is w^T, which maps output to input gradients
-        matmul(weight(packed, m_layout, w_rgb), false, operand(grad_outputs), false, grad_v2.data_ptr(), m_layout.view_width, CUDA_R_16F, 0.0f, drelu(3, m_layout.view_width, b_2));
+        matmul(weight(packed, m_layout, w_rgb), false, operand(grad_outputs), false, grad_v2.data_ptr(), m_layout.view_width, CUDA_R_16BF, 0.0f, drelu(3, m_layout.view_width, b_2));
         weight_grad(grad_outputs, v2, w_rgb);
-        matmul(weight(packed, m_layout, w_2), false, operand(grad_v2), false, grad_v1.data_ptr(), m_layout.view_width, CUDA_R_16F, 0.0f, drelu(2, m_layout.view_width, b_1));
+        matmul(weight(packed, m_layout, w_2), false, operand(grad_v2), false, grad_v1.data_ptr(), m_layout.view_width, CUDA_R_16BF, 0.0f, drelu(2, m_layout.view_width, b_1));
         weight_grad(grad_v2, v1, w_2);
-        matmul(weight(packed, m_layout, w_1), false, operand(grad_v1), false, grad_v0.data_ptr(), m_layout.view_width, CUDA_R_16F, 0.0f, drelu(1, m_layout.view_width, -1));
+        matmul(weight(packed, m_layout, w_1), false, operand(grad_v1), false, grad_v0.data_ptr(), m_layout.view_width, CUDA_R_16BF, 0.0f, drelu(1, m_layout.view_width, -1));
         weight_grad(grad_v1, v0, w_1);
         weight_grad(grad_v0, inputs, w_combined);
         weight_grad(grad_outputs, inputs, w_skip);
         // hidden gradient from both layers reading inputs (only the first density_width input columns are hidden features)
         const Operand combined = weight(packed, m_layout, w_combined), skip = weight(packed, m_layout, w_skip);
-        matmul({combined.data, m_layout.density_width, combined.cols, combined.ld, combined.type}, false, operand(grad_v0), false, grad_hidden.data_ptr(), m_layout.density_width, CUDA_R_16F, 0.0f);
-        matmul({skip.data, m_layout.density_width, skip.cols, skip.ld, skip.type}, false, operand(grad_outputs), false, grad_hidden.data_ptr(), m_layout.density_width, CUDA_R_16F, 1.0f, drelu(0, m_layout.density_width, b_density));
+        matmul({combined.data, m_layout.density_width, combined.cols, combined.ld, combined.type}, false, operand(grad_v0), false, grad_hidden.data_ptr(), m_layout.density_width, CUDA_R_16BF, 0.0f);
+        matmul({skip.data, m_layout.density_width, skip.cols, skip.ld, skip.type}, false, operand(grad_outputs), false, grad_hidden.data_ptr(), m_layout.density_width, CUDA_R_16BF, 1.0f, drelu(0, m_layout.density_width, b_density));
         weight_grad(grad_hidden, features, w_density);
-        matmul(weight(packed, m_layout, w_density), false, operand(grad_hidden), false, grad_features.data_ptr(), features.size(1), CUDA_R_16F, 0.0f);
+        matmul(weight(packed, m_layout, w_density), false, operand(grad_hidden), false, grad_features.data_ptr(), features.size(1), CUDA_R_16BF, 0.0f);
         unpack_kernel<<<n_blocks(m_layout.params[n_parameters]), block_size, 0, c10::cuda::getCurrentCUDAStream()>>>(
             params.data_ptr<float>(), weight_grads_data, bias_grads_data, m_layout, grad_params.data_ptr<float>());
         C10_CUDA_KERNEL_LAUNCH_CHECK();

@@ -12,10 +12,11 @@ namespace mlp_api = zipnerf::mlp;
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.attr("grid_max_value") = zipnerf::config::hash_init_range / zipnerf::config::precondition_scaling;
-    m.attr("nerf_mlp_grad_scale") = zipnerf::config::nerf_mlp_grad_scale;
+    m.attr("nerf_grid_grad_scale") = zipnerf::config::nerf_grid_grad_scale;
     m.def("set_rtc_dirs", &featurization_api::set_rtc_dirs);
     py::class_<featurization_api::Featurizer>(m, "Featurizer")
         .def(py::init<int, const std::vector<int64_t>&, const std::vector<int64_t>&, int, int>())
+        .def_property_readonly("n_fp32_grad_rows", &featurization_api::Featurizer::n_fp32_grad_rows)
         .def("forward", &featurization_api::Featurizer::forward)
         .def("backward", &featurization_api::Featurizer::backward)
         .def("backward_mlp", &featurization_api::Featurizer::backward_mlp);

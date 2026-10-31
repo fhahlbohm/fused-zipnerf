@@ -1,6 +1,7 @@
 #include "optimizer_api.h"
 
 #include <c10/cuda/CUDAStream.h>
+#include <cuda_fp16.h>
 
 #include <cfloat>
 #include <algorithm>
@@ -18,6 +19,7 @@ namespace zipnerf::optimizer {
     struct Buffer {
         float4* param;
         float4* grad;
+        uint2* grad_half;  // four fp16 values (instead of grad)
         float4* exp_avg;
         float4* exp_avg_sq;
         int64_t start;  // first group in the concatenated groups of all buffers
@@ -78,13 +80,24 @@ namespace zipnerf::optimizer {
             const Buffer& buffer = params.buffers[range.buffer];
             const float reg_weight = range.level >= 0 ? params.level_reg_weights[range.level] : 0.0f;
             const int64_t i = idx - buffer.start;
-            float4 p = buffer.param[i], g = buffer.grad[i], m = buffer.exp_avg[i], v = buffer.exp_avg_sq[i];
+            float4 p = buffer.param[i], m = buffer.exp_avg[i], v = buffer.exp_avg_sq[i];
+            float4 g;
+            if (buffer.grad_half != nullptr) {
+                const uint2 h = buffer.grad_half[i];
+                const float2 xy = __half22float2(*reinterpret_cast<const __half2*>(&h.x)), zw = __half22float2(*reinterpret_cast<const __half2*>(&h.y));
+                g = make_float4(fminf(fmaxf(xy.x, -65504.0f), 65504.0f), fminf(fmaxf(xy.y, -65504.0f), 65504.0f),
+                    fminf(fmaxf(zw.x, -65504.0f), 65504.0f), fminf(fmaxf(zw.y, -65504.0f), 65504.0f));
+            }
+            else {
+                g = buffer.grad[i];
+            }
             range_sum += adam_update(p.x, g.x, m.x, v.x, buffer.inv_grad_scale, reg_weight, params);
             range_sum += adam_update(p.y, g.y, m.y, v.y, buffer.inv_grad_scale, reg_weight, params);
             range_sum += adam_update(p.z, g.z, m.z, v.z, buffer.inv_grad_scale, reg_weight, params);
             range_sum += adam_update(p.w, g.w, m.w, v.w, buffer.inv_grad_scale, reg_weight, params);
             buffer.param[i] = p;
-            buffer.grad[i] = g;
+            if (buffer.grad_half != nullptr) buffer.grad_half[i] = make_uint2(0u, 0u);
+            else buffer.grad[i] = g;
             buffer.exp_avg[i] = m;
             buffer.exp_avg_sq[i] = v;
         }
@@ -112,9 +125,10 @@ namespace zipnerf::optimizer {
         }
     }
 
-    static void check_buffer(const torch::Tensor& tensor, const char* name) {
-        if (!tensor.is_cuda() || !tensor.is_contiguous() || tensor.scalar_type() != torch::kFloat || tensor.numel() % 4 != 0) {
-            throw std::runtime_error(std::string("ZipNeRF: ") + name + " must be a contiguous float cuda tensor with a multiple of four elements");
+    static void check_buffer(const torch::Tensor& tensor, const char* name, const bool allow_half = false) {
+        const bool valid_type = tensor.scalar_type() == torch::kFloat || (allow_half && tensor.scalar_type() == torch::kHalf);
+        if (!tensor.is_cuda() || !tensor.is_contiguous() || !valid_type || tensor.numel() % 4 != 0) {
+            throw std::runtime_error(std::string("ZipNeRF: ") + name + " must be a contiguous float (or half) cuda tensor with a multiple of four elements");
         }
     }
 
@@ -139,7 +153,7 @@ namespace zipnerf::optimizer {
         }
         for (size_t buffer = 0; buffer < n_buffers; buffer++) {
             check_buffer(params[buffer], "param");
-            check_buffer(grads[buffer], "grad");
+            check_buffer(grads[buffer], "grad", true);
             if (grads[buffer].numel() != params[buffer].numel()) throw std::runtime_error("ZipNeRF: optimizer gradient size mismatch");
             const std::vector<int64_t>& offsets = level_offsets[buffer];
             if (!offsets.empty()) {
@@ -171,8 +185,11 @@ namespace zipnerf::optimizer {
         int64_t n_groups = 0;
         int level = 0;
         for (size_t buffer = 0; buffer < m_params.size(); buffer++) {
+            const bool half_grad = m_grads[buffer].scalar_type() == torch::kHalf;
             params.buffers[buffer] = {
-                reinterpret_cast<float4*>(m_params[buffer].data_ptr<float>()), reinterpret_cast<float4*>(m_grads[buffer].data_ptr<float>()),
+                reinterpret_cast<float4*>(m_params[buffer].data_ptr<float>()),
+                half_grad ? nullptr : reinterpret_cast<float4*>(m_grads[buffer].data_ptr<float>()),
+                half_grad ? reinterpret_cast<uint2*>(m_grads[buffer].data_ptr()) : nullptr,
                 reinterpret_cast<float4*>(m_exp_avgs[buffer].data_ptr<float>()), reinterpret_cast<float4*>(m_exp_avg_sqs[buffer].data_ptr<float>()),
                 n_groups, static_cast<float>(1.0 / m_grad_scales[buffer])};
             const std::vector<int64_t>& offsets = m_level_offsets[buffer];

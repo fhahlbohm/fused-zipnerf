@@ -9,7 +9,7 @@ from Methods.Base.GuiTrainer import GuiTrainer
 from Methods.Base.utils import pre_training_callback, training_callback
 from Methods.ZipNeRF.Loss import ZipNeRFLoss
 from Methods.ZipNeRF.utils import pixel_radius, schlick_bias
-from Methods.ZipNeRF.ZipNeRFCudaBackend import Adam, generate_rays, train_final, nerf_mlp_grad_scale
+from Methods.ZipNeRF.ZipNeRFCudaBackend import Adam, generate_rays, train_final, nerf_grid_grad_scale
 from Optim.lr_utils import LRDecayPolicy
 
 
@@ -39,12 +39,21 @@ class ZipNeRFTrainer(GuiTrainer):
     def __init__(self, **kwargs) -> None:
         super().__init__(**kwargs)
         grids = self.model.grids
-        buffers = [grid.table for grid in grids] + [self.model.proposal_mlp_params, self.model.nerf_mlp_params]
-        for buffer in buffers:
+        for buffer in [grid.table for grid in grids[:-1]] + [self.model.proposal_mlp_params, self.model.nerf_mlp_params]:
             buffer.grad = torch.zeros_like(buffer)
+        # the NeRF grid gradient is accumulated in fp32 for the coarse levels and in fp16 for the others, so the NeRF
+        # table is optimized as two buffers (rows of the coarse levels and of the others)
+        nerf_table, nerf_offsets, n_features = grids[-1].table, grids[-1].offsets, grids[-1].n_features_per_level
+        split = self.renderer.featurizers[-1].n_fp32_grad_rows
+        n_fp32_levels = nerf_offsets.index(split)
+        self.nerf_table_grads = (torch.zeros_like(nerf_table[:split]), torch.zeros_like(nerf_table[split:], dtype=torch.half))
         self.optimizer = Adam(
-            buffers, [buffer.grad for buffer in buffers], [1.0] * (len(grids) + 1) + [nerf_mlp_grad_scale],
-            [[offset * grid.n_features_per_level for offset in grid.offsets] for grid in grids] + [[], []],
+            [grid.table for grid in grids[:-1]] + [nerf_table[:split], nerf_table[split:], self.model.proposal_mlp_params, self.model.nerf_mlp_params],
+            [grid.table.grad for grid in grids[:-1]] + [*self.nerf_table_grads, self.model.proposal_mlp_params.grad, self.model.nerf_mlp_params.grad],
+            [1.0] * (len(grids) - 1) + [nerf_grid_grad_scale, nerf_grid_grad_scale, 1.0, 1.0],
+            [[offset * grid.n_features_per_level for offset in grid.offsets] for grid in grids[:-1]] + [
+                [offset * n_features for offset in nerf_offsets[:n_fp32_levels + 1]],
+                [(offset - split) * n_features for offset in nerf_offsets[n_fp32_levels:]], [], []],
             self.LOSS.LAMBDA_GRID_REGULARIZATION, grids[0].max_value, 0.9, 0.99, 1e-15, self.model.scale_magnitudes)
         self.lr_policy = LRDecayPolicy(
             lr_init=self.LEARNING_RATE.INIT, lr_final=self.LEARNING_RATE.FINAL, lr_delay_steps=self.LEARNING_RATE.DELAY_STEPS,
@@ -105,7 +114,7 @@ class ZipNeRFTrainer(GuiTrainer):
         features_grad = self.renderer.nerf_mlp.backward(
             nerf_outputs_grad, state['features'], state['nerf_weights'], state['nerf_context'], self.model.nerf_mlp_params, self.model.nerf_mlp_params.grad)
         self.renderer.featurizers[-1].backward(
-            origins, directions, radii, state['tdist'], seed, features_grad, self.model.grids[-1].table.grad)
+            origins, directions, radii, state['tdist'], seed, features_grad, *self.nerf_table_grads)
         # backward of the proposal levels
         for level, proposal in enumerate(proposals):
             self.renderer.featurizers[level].backward_mlp(

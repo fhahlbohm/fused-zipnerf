@@ -20,7 +20,7 @@ from Visual.utils import apply_color_map
     USE_MEDIAN_DEPTH=False,  # if True, the depth is the median depth instead of the expected depth
 )
 class ZipNeRFRenderer(BaseRenderer):
-    """Renders ZipNeRF with runtime-compiled featurization kernels and fp16 cuBLASLt GEMMs for the NeRF MLP."""
+    """Renders ZipNeRF with runtime-compiled featurization kernels and bf16 cuBLASLt GEMMs for the NeRF MLP."""
 
     def __init__(self, model: BaseModel) -> None:
         super().__init__(model, [ZipNeRFModel])
@@ -70,8 +70,8 @@ class ZipNeRFRenderer(BaseRenderer):
                 proposal['raw_density'], proposal['sdist'], proposal['tdist'], directions, anneal, n_samples[level + 1], seed, level + 1, warp)
             proposals.append(proposal)
         n_final = n_rays * n_samples[-1]
-        features = torch.empty(n_final, self.nerf_mlp.n_features, dtype=torch.half)
-        inputs = torch.empty(n_final, self.nerf_mlp.n_inputs, dtype=torch.half)
+        features = torch.empty(n_final, self.nerf_mlp.n_features, dtype=torch.bfloat16)
+        inputs = torch.empty(n_final, self.nerf_mlp.n_inputs, dtype=torch.bfloat16)
         self.featurizers[-1].forward(
             *rays, tdist, seed, False, self.model.grids[-1].table, scale_magnitudes[-1], empty, empty, empty, empty,
             empty, empty, features, encoded_directions, inputs)
@@ -109,8 +109,8 @@ class ZipNeRFRenderer(BaseRenderer):
                 raw_density, empty, empty, empty, empty)
             _, sdist, tdist = composite_and_resample(raw_density, sdist, tdist, directions, 1.0, n_samples[level + 1], -1, level + 1, warp)
         n_final = n_rays * n_samples[-1]
-        features = torch.empty(n_final, self.nerf_mlp.n_features, dtype=torch.half)
-        inputs = torch.empty(n_final, self.nerf_mlp.n_inputs, dtype=torch.half)
+        features = torch.empty(n_final, self.nerf_mlp.n_features, dtype=torch.bfloat16)
+        inputs = torch.empty(n_final, self.nerf_mlp.n_inputs, dtype=torch.bfloat16)
         self.featurizers[-1].forward(
             origins, directions, radii, tdist, -1, True, self.model.grids[-1].table, scale_magnitudes[-1], empty, empty, empty, empty,
             empty, empty, features, encoded_directions, inputs)

@@ -3,6 +3,7 @@
 // tokens defined by the preamble generated in featurizer.cu:
 //   JIT_N_LEVELS, JIT_N_FEATURES: grid levels and features per level (each level adds one scale feature)
 //   JIT_MLP_WIDTH: hidden width of the fused density mlp (0 without)
+//   JIT_N_FP32_GRAD_LEVELS: leading levels whose gradient featurize_backward accumulates in fp32 (the others in fp16)
 //   JIT_PRECONDITION_SCALING: scale of the grid features (see zipnerf_config.h)
 //   JIT_PATTERN_STREAM: random stream of the level's multisampling patterns (see random.cuh, prepended by featurizer.cu)
 //   zipnerf::config::level_size/level_entries/level_offset/level_hashed: per-level grid layout
@@ -19,18 +20,20 @@ namespace zipnerf {
     constexpr float tiny = 1.17549435e-38f;
     constexpr float feature_scale = JIT_PRECONDITION_SCALING / n_multisamples;
 
-    // fp16 conversions without cuda_fp16.h
+    // fp16 (grid gradients) and bf16 (NeRF MLP) conversions without cuda_fp16.h and cuda_bf16.h
     __device__ inline uint16_t float_to_half(const float value) {
         uint16_t result;
         asm("cvt.rn.f16.f32 %0, %1;" : "=h"(result) : "f"(value));
         return result;
     }
 
-    __device__ inline float half_to_float(const uint16_t value) {
-        float result;
-        asm("cvt.f32.f16 %0, %1;" : "=f"(result) : "h"(value));
+    __device__ inline uint16_t float_to_bf16(const float value) {
+        uint16_t result;
+        asm("cvt.rn.bf16.f32 %0, %1;" : "=h"(result) : "f"(value));
         return result;
     }
+
+    __device__ inline float bf16_to_float(const uint16_t value) { return __uint_as_float(static_cast<uint32_t>(value) << 16); }
 
     __device__ inline float3 operator+(const float3& a, const float3& b) { return ::make_float3(a.x + b.x, a.y + b.y, a.z + b.z); }
     __device__ inline float3 operator*(const float a, const float3& b) { return ::make_float3(a * b.x, a * b.y, a * b.z); }
@@ -225,8 +228,51 @@ namespace zipnerf {
         }
     }
 
-    // accumulates the grid gradient of an interval's feature gradient (scale features carry no gradient)
-    __device__ inline void scatter_feature_gradients(const RayInterval& interval, const float* grad_features, float* __restrict__ grad_table) {
+    // adds the weighted feature gradient to a row of an fp32 grid gradient
+    __device__ inline void add_row_gradient(float* __restrict__ grad_table, const uint32_t row, const float weight, const float* g) {
+        float* grad_row = grad_table + row * JIT_N_FEATURES;
+#if __CUDA_ARCH__ >= 900 && JIT_N_FEATURES == 4
+        // vector atomics for rows of 4 features (16 byte aligned)
+        asm volatile("red.global.add.v4.f32 [%0], {%1, %2, %3, %4};" :: "l"(grad_row),
+            "f"(weight * g[0]), "f"(weight * g[1]), "f"(weight * g[2]), "f"(weight * g[3]) : "memory");
+#else
+        #pragma unroll
+        for (uint32_t f = 0; f < JIT_N_FEATURES; f++) {
+            if (g[f] != 0.0f) atomicAdd(grad_row + f, weight * g[f]);
+        }
+#endif
+    }
+
+    // adds the weighted feature gradient to a row of an fp16 grid gradient: one 8 byte vector atomic for rows of 4
+    // features (sm_90+), else packed half2 atomics (an atomic costs one L2 request regardless of its width)
+    __device__ inline void add_row_gradient(uint16_t* __restrict__ grad_table, const uint32_t row, const float weight, const float* g) {
+#if JIT_N_FEATURES % 2 == 0
+        uint32_t* grad_row = reinterpret_cast<uint32_t*>(grad_table + row * JIT_N_FEATURES);
+        uint32_t pairs[JIT_N_FEATURES / 2];
+        #pragma unroll
+        for (uint32_t p = 0; p < JIT_N_FEATURES / 2; p++) {
+            asm("cvt.rn.f16x2.f32 %0, %1, %2;" : "=r"(pairs[p]) : "f"(weight * g[2 * p + 1]), "f"(weight * g[2 * p]));
+        }
+#if __CUDA_ARCH__ >= 900 && JIT_N_FEATURES == 4
+        asm volatile("red.global.add.noftz.v2.f16x2 [%0], {%1, %2};" :: "l"(grad_row), "r"(pairs[0]), "r"(pairs[1]) : "memory");
+#else
+        #pragma unroll
+        for (uint32_t p = 0; p < JIT_N_FEATURES / 2; p++) {
+            asm volatile("red.global.add.noftz.f16x2 [%0], %1;" :: "l"(grad_row + p), "r"(pairs[p]) : "memory");
+        }
+#endif
+#else
+        #pragma unroll
+        for (uint32_t f = 0; f < JIT_N_FEATURES; f++) {
+            if (g[f] != 0.0f) asm volatile("red.global.add.noftz.f16 [%0], %1;" :: "l"(grad_table + row * JIT_N_FEATURES + f), "h"(float_to_half(weight * g[f])) : "memory");
+        }
+#endif
+    }
+
+    // accumulates the grid gradient of an interval's feature gradient (scale features carry no gradient): the first
+    // n_fp32_levels levels into grad_table (fp32), the others into grad_table_half (fp16, rows from the first fp16 level)
+    template <uint32_t n_fp32_levels>
+    __device__ inline void scatter_feature_gradients(const RayInterval& interval, const float* grad_features, float* __restrict__ grad_table, uint16_t* __restrict__ grad_table_half) {
         float3 x[n_multisamples];
         float scale[n_multisamples];
         #pragma unroll
@@ -242,19 +288,8 @@ namespace zipnerf {
             const float* g = grad_features + level * n_level_features;
             for (uint32_t c = 0; c < n_corners; c++) {
                 if (weights[c] == 0.0f) continue;
-                float* grad_row = grad_table + rows[c] * JIT_N_FEATURES;
-#if __CUDA_ARCH__ >= 900
-                // vector atomics for rows of 4 features (16 byte aligned)
-                if (JIT_N_FEATURES == 4) {
-                    asm volatile("red.global.add.v4.f32 [%0], {%1, %2, %3, %4};" :: "l"(grad_row),
-                        "f"(weights[c] * g[0]), "f"(weights[c] * g[1]), "f"(weights[c] * g[2]), "f"(weights[c] * g[3]) : "memory");
-                    continue;
-                }
-#endif
-                #pragma unroll
-                for (uint32_t f = 0; f < JIT_N_FEATURES; f++) {
-                    if (g[f] != 0.0f) atomicAdd(grad_row + f, weights[c] * g[f]);
-                }
+                if (level < n_fp32_levels) add_row_gradient(grad_table, rows[c], weights[c], g);
+                else add_row_gradient(grad_table_half, rows[c] - config::level_offset(n_fp32_levels), weights[c], g);
             }
         }
     }

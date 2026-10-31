@@ -68,8 +68,8 @@ namespace zipnerf::sampling {
         torch::Tensor& depth,
         const bool use_median_depth);
 
-    // training losses and their gradients w.r.t. the raw outputs of all levels: returns the NeRF MLP output gradient
-    // (scaled by the NeRF MLP gradient scale), the proposal raw density gradients, and the loss sums if requested
+    // training losses and their gradients w.r.t. the raw outputs of all levels: returns the NeRF MLP output gradient, the
+    // proposal raw density gradients, and the loss sums if requested
     std::tuple<torch::Tensor, std::vector<torch::Tensor>, torch::Tensor> train_final_wrapper(
         const torch::Tensor& nerf_outputs,
         const torch::Tensor& sdist,

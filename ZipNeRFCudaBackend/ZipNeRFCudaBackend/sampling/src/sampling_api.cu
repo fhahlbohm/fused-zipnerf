@@ -4,7 +4,7 @@
 #include "zipnerf_config.h"
 
 #include <c10/cuda/CUDAStream.h>
-#include <cuda_fp16.h>
+#include <cuda_bf16.h>
 
 #include <stdexcept>
 
@@ -41,18 +41,18 @@ namespace zipnerf::sampling {
     // intervals of the first level, which samples a single unit interval (jitter < 0: centered samples)
     __device__ inline void initialize_ray(
         const float3 d, const float jitter, const int direction_degree, const int n_samples, const RayWarp& warp,
-        __half* encoded, float* sdist, float* tdist)
+        __nv_bfloat16* encoded, float* sdist, float* tdist)
     {
         const float inv_norm = 1.0f / norm3(d);
         const float v[3] = {d.x * inv_norm, d.y * inv_norm, d.z * inv_norm};
-        for (int i = 0; i < config::direction_block_width(direction_degree); i++) encoded[i] = __float2half(0.0f);
+        for (int i = 0; i < config::direction_block_width(direction_degree); i++) encoded[i] = __float2bfloat16(0.0f);
         for (int c = 0; c < 3; c++) {
-            encoded[c] = __float2half(v[c]);
+            encoded[c] = __float2bfloat16(v[c]);
             for (int k = 0; k < direction_degree; k++) {
                 float sin_value, cos_value;
                 sincosf(scalbnf(v[c], k), &sin_value, &cos_value);
-                encoded[3 + 3 * k + c] = __float2half(sin_value);
-                encoded[3 + 3 * (direction_degree + k) + c] = __float2half(cos_value);
+                encoded[3 + 3 * k + c] = __float2bfloat16(sin_value);
+                encoded[3 + 3 * (direction_degree + k) + c] = __float2bfloat16(cos_value);
             }
         }
         const float t_init[2] = {0.0f, 1.0f};
@@ -82,7 +82,7 @@ namespace zipnerf::sampling {
         float* __restrict__ directions,
         float* __restrict__ radii,
         float* __restrict__ rgb,
-        __half* __restrict__ encoded_directions,
+        __nv_bfloat16* __restrict__ encoded_directions,
         float* __restrict__ sdist,
         float* __restrict__ tdist,
         const int direction_degree,
@@ -124,7 +124,7 @@ namespace zipnerf::sampling {
         float* __restrict__ origins,
         float* __restrict__ directions,
         float* __restrict__ radii,
-        __half* __restrict__ encoded_directions,
+        __nv_bfloat16* __restrict__ encoded_directions,
         float* __restrict__ sdist,
         float* __restrict__ tdist,
         const int direction_degree,
@@ -150,7 +150,7 @@ namespace zipnerf::sampling {
     __global__ void initialize_rays_kernel(
         const int64_t seed,
         const float* __restrict__ directions,
-        __half* __restrict__ encoded_directions,
+        __nv_bfloat16* __restrict__ encoded_directions,
         float* __restrict__ sdist,
         float* __restrict__ tdist,
         const int direction_degree,
@@ -202,17 +202,17 @@ namespace zipnerf::sampling {
 
     // densities, colors (and their sigmoids), optical depths, and weights of the final level from the NeRF MLP outputs
     __device__ inline void evaluate_final(
-        const __half* nerf_outputs, const float* t,
+        const __nv_bfloat16* nerf_outputs, const float* t,
         const int n, const float direction_norm, const int ray_idx,
         float* density, float* x, float* w, float3* colors, float3* sigmoids)
     {
         for (int i = 0; i < n; i++) {
-            const int64_t sample_idx = static_cast<int64_t>(ray_idx) * n + i;
-            density[i] = activate_density(__half2float(nerf_outputs[n_nerf_outputs * sample_idx]));
-            const float3 s = make_float3(
-                1.0f / (1.0f + expf(-__half2float(nerf_outputs[n_nerf_outputs * sample_idx + 1]))),
-                1.0f / (1.0f + expf(-__half2float(nerf_outputs[n_nerf_outputs * sample_idx + 2]))),
-                1.0f / (1.0f + expf(-__half2float(nerf_outputs[n_nerf_outputs * sample_idx + 3]))));
+            const __nv_bfloat16* raw = nerf_outputs + n_nerf_outputs * (static_cast<int64_t>(ray_idx) * n + i);
+            const float r0 = __bfloat162float(raw[0]), r1 = __bfloat162float(raw[1]), r2 = __bfloat162float(raw[2]), r3 = __bfloat162float(raw[3]);
+            // a sample with non-finite outputs is empty, so that it cannot spread NaNs to the loss and all gradients
+            const bool valid = isfinite(r0) && isfinite(r1) && isfinite(r2) && isfinite(r3);
+            density[i] = valid ? activate_density(r0) : 0.0f;
+            const float3 s = valid ? make_float3(1.0f / (1.0f + expf(-r1)), 1.0f / (1.0f + expf(-r2)), 1.0f / (1.0f + expf(-r3))) : make_float3(0.5f, 0.5f, 0.5f);
             sigmoids[i] = s;
             colors[i] = make_float3(s.x * (1.0f + 2.0f * rgb_padding) - rgb_padding, s.y * (1.0f + 2.0f * rgb_padding) - rgb_padding, s.z * (1.0f + 2.0f * rgb_padding) - rgb_padding);
         }
@@ -229,21 +229,20 @@ namespace zipnerf::sampling {
     }
 
     __global__ void train_final_kernel(
-        const __half* __restrict__ nerf_outputs,
+        const __nv_bfloat16* __restrict__ nerf_outputs,
         const float* __restrict__ sdist,
         const float* __restrict__ tdist,
         const ProposalLevels proposals,
         const float* __restrict__ directions,
         const uint64_t seed,
         const float* __restrict__ rgb_target,
-        __half* __restrict__ nerf_outputs_grad,
+        __nv_bfloat16* __restrict__ nerf_outputs_grad,
         float* __restrict__ loss_sums,
         const int n_intervals,
         const float charbonnier_padding,
         const float distortion_weight,
         const float distortion_power,
         const float distortion_premult,
-        const float grad_scale,
         const int n_rays)
     {
         const int ray_idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -318,17 +317,17 @@ namespace zipnerf::sampling {
 
         // gradients of the final level's raw outputs (raw density and rgb logits, zero padding)
         float raw[max_intervals];
-        for (int i = 0; i < n; i++) raw[i] = __half2float(nerf_outputs[n_nerf_outputs * (static_cast<int64_t>(ray_idx) * n_intervals + i)]);
+        for (int i = 0; i < n; i++) raw[i] = __bfloat162float(nerf_outputs[n_nerf_outputs * (static_cast<int64_t>(ray_idx) * n_intervals + i)]);
         weights_backward_to_raw(grad_w, x, w, density, raw, t, n, direction_norm);
         for (int i = 0; i < n; i++) {
-            __half* grad = nerf_outputs_grad + n_nerf_outputs * (static_cast<int64_t>(ray_idx) * n_intervals + i);
+            __nv_bfloat16* grad = nerf_outputs_grad + n_nerf_outputs * (static_cast<int64_t>(ray_idx) * n_intervals + i);
             const float3 sg = sigmoids[i];
-            const float color_scale = w[i] * grad_scale * (1.0f + 2.0f * rgb_padding);
-            grad[0] = __float2half(grad_scale * grad_w[i]);
-            grad[1] = __float2half(color_scale * grad_rgb.x * sg.x * (1.0f - sg.x));
-            grad[2] = __float2half(color_scale * grad_rgb.y * sg.y * (1.0f - sg.y));
-            grad[3] = __float2half(color_scale * grad_rgb.z * sg.z * (1.0f - sg.z));
-            for (int c = 4; c < n_nerf_outputs; c++) grad[c] = __float2half(0.0f);
+            const float color_scale = w[i] * (1.0f + 2.0f * rgb_padding);
+            grad[0] = __float2bfloat16(grad_w[i]);
+            grad[1] = __float2bfloat16(color_scale * grad_rgb.x * sg.x * (1.0f - sg.x));
+            grad[2] = __float2bfloat16(color_scale * grad_rgb.y * sg.y * (1.0f - sg.y));
+            grad[3] = __float2bfloat16(color_scale * grad_rgb.z * sg.z * (1.0f - sg.z));
+            for (int c = 4; c < n_nerf_outputs; c++) grad[c] = __float2bfloat16(0.0f);
         }
 
         // interlevel losses of the proposal levels against the blurred final weights
@@ -368,7 +367,7 @@ namespace zipnerf::sampling {
 
     // inference: color, opacity, and depth from the NeRF MLP outputs of all intervals, written to the rays' pixels
     __global__ void composite_final_kernel(
-        const __half* __restrict__ nerf_outputs,
+        const __nv_bfloat16* __restrict__ nerf_outputs,
         const float* __restrict__ tdist,
         const float* __restrict__ directions,
         const float* __restrict__ background,
@@ -471,7 +470,7 @@ namespace zipnerf::sampling {
         torch::Tensor directions = torch::empty({n_rays, 3}, options);
         torch::Tensor radii = torch::empty({n_rays}, options);
         torch::Tensor rgb = torch::empty({n_rays, 3}, options);
-        torch::Tensor encoded_directions = torch::empty({n_rays, config::direction_block_width(direction_degree)}, options.dtype(torch::kHalf));
+        torch::Tensor encoded_directions = torch::empty({n_rays, config::direction_block_width(direction_degree)}, options.dtype(torch::kBFloat16));
         torch::Tensor sdist = torch::empty({n_rays, n_samples + 1}, options);
         torch::Tensor tdist = torch::empty({n_rays, n_samples + 1}, options);
         if (n_rays > 0) {
@@ -480,7 +479,7 @@ namespace zipnerf::sampling {
                 view_cameras.data_ptr<int>(), camera_offsets.data_ptr<int64_t>(), local_directions.data_ptr<float>(),
                 c2w.data_ptr<float>(), camera_radii.data_ptr<float>(), pool_rgb.data_ptr<uint8_t>(),
                 origins.data_ptr<float>(), directions.data_ptr<float>(), radii.data_ptr<float>(), rgb.data_ptr<float>(),
-                reinterpret_cast<__half*>(encoded_directions.data_ptr<torch::Half>()), sdist.data_ptr<float>(), tdist.data_ptr<float>(),
+                reinterpret_cast<__nv_bfloat16*>(encoded_directions.data_ptr<torch::BFloat16>()), sdist.data_ptr<float>(), tdist.data_ptr<float>(),
                 direction_degree, n_samples, make_ray_warp(ray_warp), n_rays);
             C10_CUDA_KERNEL_LAUNCH_CHECK();
         }
@@ -506,14 +505,14 @@ namespace zipnerf::sampling {
         torch::Tensor origins = torch::empty({n_rays, 3}, options);
         torch::Tensor directions = torch::empty({n_rays, 3}, options);
         torch::Tensor radii = torch::empty({n_rays}, options);
-        torch::Tensor encoded_directions = torch::empty({n_rays, config::direction_block_width(direction_degree)}, options.dtype(torch::kHalf));
+        torch::Tensor encoded_directions = torch::empty({n_rays, config::direction_block_width(direction_degree)}, options.dtype(torch::kBFloat16));
         torch::Tensor sdist = torch::empty({n_rays, n_samples + 1}, options);
         torch::Tensor tdist = torch::empty({n_rays, n_samples + 1}, options);
         if (n_rays > 0) {
             view_rays_kernel<<<n_blocks(n_rays), block_size, 0, c10::cuda::getCurrentCUDAStream()>>>(
                 pixel_indices.data_ptr<int64_t>(), local_directions.data_ptr<float>(), c2w.data_ptr<float>(), static_cast<float>(radius),
                 origins.data_ptr<float>(), directions.data_ptr<float>(), radii.data_ptr<float>(),
-                reinterpret_cast<__half*>(encoded_directions.data_ptr<torch::Half>()), sdist.data_ptr<float>(), tdist.data_ptr<float>(),
+                reinterpret_cast<__nv_bfloat16*>(encoded_directions.data_ptr<torch::BFloat16>()), sdist.data_ptr<float>(), tdist.data_ptr<float>(),
                 direction_degree, n_samples, make_ray_warp(ray_warp), n_rays);
             C10_CUDA_KERNEL_LAUNCH_CHECK();
         }
@@ -530,12 +529,12 @@ namespace zipnerf::sampling {
         check_input(directions, "directions", torch::kFloat);
         check_n_intervals(n_samples);
         const int n_rays = static_cast<int>(directions.size(0));
-        torch::Tensor encoded_directions = torch::empty({n_rays, config::direction_block_width(direction_degree)}, directions.options().dtype(torch::kHalf));
+        torch::Tensor encoded_directions = torch::empty({n_rays, config::direction_block_width(direction_degree)}, directions.options().dtype(torch::kBFloat16));
         torch::Tensor sdist = torch::empty({n_rays, n_samples + 1}, directions.options());
         torch::Tensor tdist = torch::empty({n_rays, n_samples + 1}, directions.options());
         if (n_rays == 0) return {encoded_directions, sdist, tdist};
         initialize_rays_kernel<<<n_blocks(n_rays), block_size, 0, c10::cuda::getCurrentCUDAStream()>>>(
-            seed, directions.data_ptr<float>(), reinterpret_cast<__half*>(encoded_directions.data_ptr<torch::Half>()), sdist.data_ptr<float>(), tdist.data_ptr<float>(),
+            seed, directions.data_ptr<float>(), reinterpret_cast<__nv_bfloat16*>(encoded_directions.data_ptr<torch::BFloat16>()), sdist.data_ptr<float>(), tdist.data_ptr<float>(),
             direction_degree, n_samples, make_ray_warp(ray_warp), n_rays);
         C10_CUDA_KERNEL_LAUNCH_CHECK();
         return {encoded_directions, sdist, tdist};
@@ -600,7 +599,7 @@ namespace zipnerf::sampling {
         const double distortion_premult,
         const bool compute_loss_sums)
     {
-        check_input(nerf_outputs, "nerf_outputs", torch::kHalf);
+        check_input(nerf_outputs, "nerf_outputs", torch::kBFloat16);
         check_input(sdist, "sdist", torch::kFloat);
         check_input(tdist, "tdist", torch::kFloat);
         check_input(directions, "directions", torch::kFloat);
@@ -638,11 +637,11 @@ namespace zipnerf::sampling {
         torch::Tensor loss_sums = compute_loss_sums ? torch::zeros({4}, tdist.options()) : torch::Tensor();
         if (n_rays == 0) return {nerf_outputs_grad, proposal_raw_density_grads, loss_sums};
         train_final_kernel<<<n_blocks(n_rays), block_size, 0, c10::cuda::getCurrentCUDAStream()>>>(
-            reinterpret_cast<const __half*>(nerf_outputs.data_ptr<torch::Half>()), sdist.data_ptr<float>(), tdist.data_ptr<float>(),
+            reinterpret_cast<const __nv_bfloat16*>(nerf_outputs.data_ptr<torch::BFloat16>()), sdist.data_ptr<float>(), tdist.data_ptr<float>(),
             proposals, directions.data_ptr<float>(), static_cast<uint64_t>(seed), rgb_target.data_ptr<float>(),
-            reinterpret_cast<__half*>(nerf_outputs_grad.data_ptr<torch::Half>()),
+            reinterpret_cast<__nv_bfloat16*>(nerf_outputs_grad.data_ptr<torch::BFloat16>()),
             compute_loss_sums ? loss_sums.data_ptr<float>() : nullptr, n_intervals, static_cast<float>(charbonnier_padding), static_cast<float>(distortion_weight),
-            static_cast<float>(distortion_power), static_cast<float>(distortion_premult), static_cast<float>(config::nerf_mlp_grad_scale), n_rays);
+            static_cast<float>(distortion_power), static_cast<float>(distortion_premult), n_rays);
         C10_CUDA_KERNEL_LAUNCH_CHECK();
         return {nerf_outputs_grad, proposal_raw_density_grads, loss_sums};
     }
@@ -658,7 +657,7 @@ namespace zipnerf::sampling {
         torch::Tensor& depth,
         const bool use_median_depth)
     {
-        check_input(nerf_outputs, "nerf_outputs", torch::kHalf);
+        check_input(nerf_outputs, "nerf_outputs", torch::kBFloat16);
         check_input(tdist, "tdist", torch::kFloat);
         check_input(directions, "directions", torch::kFloat);
         check_input(background, "background", torch::kFloat);
@@ -672,7 +671,7 @@ namespace zipnerf::sampling {
         if (nerf_outputs.numel() != static_cast<int64_t>(n_rays) * n_intervals * n_nerf_outputs || pixel_indices.numel() != n_rays) throw std::runtime_error("ZipNeRF: invalid composite_final inputs");
         if (n_rays == 0) return;
         composite_final_kernel<<<n_blocks(n_rays), block_size, 0, c10::cuda::getCurrentCUDAStream()>>>(
-            reinterpret_cast<const __half*>(nerf_outputs.data_ptr<torch::Half>()), tdist.data_ptr<float>(), directions.data_ptr<float>(),
+            reinterpret_cast<const __nv_bfloat16*>(nerf_outputs.data_ptr<torch::BFloat16>()), tdist.data_ptr<float>(), directions.data_ptr<float>(),
             background.data_ptr<float>(), pixel_indices.data_ptr<int64_t>(), rgb.data_ptr<float>(),
             alpha.numel() > 0 ? alpha.data_ptr<float>() : nullptr, depth.numel() > 0 ? depth.data_ptr<float>() : nullptr,
             n_intervals, n_rays, use_median_depth);

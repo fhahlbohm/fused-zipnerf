@@ -1,7 +1,7 @@
 from ZipNeRFCudaBackend import _C
 
 grid_max_value = _C.grid_max_value
-nerf_mlp_grad_scale = _C.nerf_mlp_grad_scale
+nerf_grid_grad_scale = _C.nerf_grid_grad_scale
 Featurizer = _C.Featurizer
 nerf_mlp_parameters = _C.nerf_mlp_parameters
 NerfMlp = _C.NerfMlp

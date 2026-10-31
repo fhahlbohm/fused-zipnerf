@@ -53,6 +53,7 @@ namespace zipnerf::featurization {
         cudaDeviceGetAttribute(&m_n_sms, cudaDevAttrMultiProcessorCount, device);
         m_level_offsets.push_back(0);
         for (const int64_t entries : level_entries) m_level_offsets.push_back(m_level_offsets.back() + entries);
+        while (m_n_fp32_grad_levels < m_n_levels && level_entries[m_n_fp32_grad_levels] < zipnerf::config::nerf_grid_min_half_grad_entries) m_n_fp32_grad_levels++;
         if (m_level_offsets.back() * n_features > static_cast<int64_t>(UINT32_MAX)) throw std::runtime_error("ZipNeRF: grid table too large for 32-bit indexing");
     }
 
@@ -63,6 +64,7 @@ namespace zipnerf::featurization {
         preamble << "#define JIT_N_LEVELS " << m_n_levels << "u\n";
         preamble << "#define JIT_N_FEATURES " << m_n_features << "u\n";
         preamble << "#define JIT_MLP_WIDTH " << m_mlp_width << "u\n";
+        preamble << "#define JIT_N_FP32_GRAD_LEVELS " << m_n_fp32_grad_levels << "u\n";
         preamble << "#define JIT_PRECONDITION_SCALING " << std::showpoint << std::setprecision(17) << zipnerf::config::precondition_scaling << "f\n";
         preamble << "#define JIT_BLOCK_SIZE " << config::block_size << "u\n";
         preamble << "#define JIT_PATTERN_STREAM " << random::pattern + m_level << "ull\n";
@@ -101,7 +103,7 @@ namespace zipnerf::featurization {
         const torch::Tensor& b1,
         torch::Tensor& raw_density,
         torch::Tensor& features_float,
-        torch::Tensor& features_half,
+        torch::Tensor& features_bf16,
         const torch::Tensor& encoded_directions,
         torch::Tensor& nerf_inputs)
     {
@@ -123,13 +125,13 @@ namespace zipnerf::featurization {
             check_input(b1, "b1", torch::kFloat);
         }
         if (features_float.numel() > 0) check_input(features_float, "features_float", torch::kFloat);
-        if (features_half.numel() > 0) {
-            check_input(features_half, "features_half", torch::kHalf);
-            if (features_half.size(0) != n_samples || features_half.size(1) < n_output_features()) throw std::runtime_error("ZipNeRF: invalid features_half");
+        if (features_bf16.numel() > 0) {
+            check_input(features_bf16, "features_bf16", torch::kBFloat16);
+            if (features_bf16.size(0) != n_samples || features_bf16.size(1) < n_output_features()) throw std::runtime_error("ZipNeRF: invalid features_bf16");
         }
         if (nerf_inputs.numel() > 0) {
-            check_input(nerf_inputs, "nerf_inputs", torch::kHalf);
-            check_input(encoded_directions, "encoded_directions", torch::kHalf);
+            check_input(nerf_inputs, "nerf_inputs", torch::kBFloat16);
+            check_input(encoded_directions, "encoded_directions", torch::kBFloat16);
             if (nerf_inputs.size(0) != n_samples || nerf_inputs.size(1) < encoded_directions.size(1)) throw std::runtime_error("ZipNeRF: invalid nerf_inputs");
         }
         if (n_samples == 0) return;
@@ -149,8 +151,8 @@ namespace zipnerf::featurization {
             optional_ptr<const float>(raw_density.numel() > 0 ? b1 : raw_density),
             optional_ptr<float>(raw_density),
             optional_ptr<float>(features_float),
-            optional_ptr<uint16_t>(features_half),
-            features_half.numel() > 0 ? static_cast<int>(features_half.size(1)) : 0,
+            optional_ptr<uint16_t>(features_bf16),
+            features_bf16.numel() > 0 ? static_cast<int>(features_bf16.size(1)) : 0,
             optional_ptr<const uint16_t>(nerf_inputs.numel() > 0 ? encoded_directions : nerf_inputs),
             optional_ptr<uint16_t>(nerf_inputs),
             nerf_inputs.numel() > 0 ? static_cast<int>(nerf_inputs.size(1)) : 0,
@@ -166,12 +168,17 @@ namespace zipnerf::featurization {
         const torch::Tensor& tdist,
         const int64_t pattern_seed,
         const torch::Tensor& grad_features,
-        torch::Tensor& grad_table)
+        torch::Tensor& grad_table,
+        torch::Tensor& grad_table_half)
     {
         check_input(grad_table, "grad_table", torch::kFloat);
+        check_input(grad_table_half, "grad_table_half", torch::kHalf);
+        if (grad_table.numel() != n_fp32_grad_rows() * m_n_features || grad_table_half.numel() != (m_level_offsets.back() - n_fp32_grad_rows()) * m_n_features) {
+            throw std::runtime_error("ZipNeRF: invalid grid gradient split");
+        }
         const int64_t n_intervals = tdist.size(1) - 1;
         const int64_t n_samples = tdist.size(0) * n_intervals;
-        check_rows(grad_features, "grad_features", torch::kHalf, n_samples, n_output_features());
+        check_rows(grad_features, "grad_features", torch::kBFloat16, n_samples, n_output_features());
         if (n_samples == 0) return;
         kernel(m_backward_kernel, "featurize_backward").launch(
             n_blocks(n_samples), config::block_size, 0, c10::cuda::getCurrentCUDAStream(),
@@ -182,8 +189,9 @@ namespace zipnerf::featurization {
             static_cast<long long>(pattern_seed),
             reinterpret_cast<const uint16_t*>(grad_features.data_ptr()),
             static_cast<int>(grad_features.stride(0)),
-            static_cast<float>(1.0 / zipnerf::config::nerf_mlp_grad_scale),
-            grad_table.data_ptr<float>(),
+            static_cast<float>(zipnerf::config::nerf_grid_grad_scale),
+            optional_ptr<float>(grad_table),
+            optional_ptr<uint16_t>(grad_table_half),
             static_cast<uint32_t>(n_samples),
             static_cast<uint32_t>(n_intervals));
     }

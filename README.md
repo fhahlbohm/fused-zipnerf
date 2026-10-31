@@ -34,9 +34,11 @@ JAX/autograd pipeline with hand-written CUDA kernels and analytic gradients, wit
 - **Featurization** (`featurization/`): the multisampled hash grid lookups (hexagonal multisampling of conical
   frustums, scene contraction, and feature downweighting) run in runtime-compiled kernels (NVRTC) with the grid layout
   baked in as constants. The small proposal MLPs are fused into these kernels in fp32, in the forward as well as in the
-  backward pass.
-- **NeRF MLP** (`mlp/`): a chain of fp16 cuBLASLt GEMMs with fused bias and ReLU epilogues. The bottleneck only feeds
-  linear layers and is therefore folded into their weights.
+  backward pass. The NeRF level accumulates its grid gradient with fp16 atomics, except for its coarsest levels, whose
+  entries receive too many contributions per step for an fp16 sum.
+- **NeRF MLP** (`mlp/`): a chain of bf16 cuBLASLt GEMMs with fused bias and ReLU epilogues (bf16 rather than fp16, as
+  the activations of the view-dependent layers can exceed the fp16 range). The bottleneck only feeds linear layers and
+  is therefore folded into their weights.
 - **Losses** (`sampling/`): compositing, resampling, and all losses (Charbonnier data loss, interlevel losses with
   blurred resampling, and distortion loss) are computed together with their gradients in fused per-ray kernels.
 - **Optimizer** (`optimizer/`): a single-launch Adam over all parameter buffers that also applies the grid
@@ -108,15 +110,30 @@ median depth if `USE_MEDIAN_DEPTH` is enabled.
 
 ## Results
 
-So far, we have only run limited tests. Garden scene of the Mip-NeRF 360 dataset (the dataset's pre-downscaled JPEGs in `images_4`, every 8th image held out for testing), default config:
+So far, we have only run limited tests. Two outdoor scenes of the Mip-NeRF 360 dataset (the dataset's pre-downscaled
+JPEGs in `images_4`, every 8th image held out for testing), default config, PSNR / SSIM:
 
-| | PSNR | SSIM |
+| | bicycle | garden |
 |---|---|---|
-| Zip-NeRF paper | 28.20 | 0.860 |
-| Official code release | 28.22 | 0.863 |
-| This implementation | 28.22 | 0.860 |
+| Zip-NeRF paper | 25.80 / 0.769 | 28.20 / 0.860 |
+| Official code release | 25.85 / 0.772 | 28.22 / 0.863 |
+| This implementation | 25.85 / 0.772 | 28.23 / 0.860 |
 
 All SSIM values use the SSIM implementation of the official code release (`dm_pix.ssim`).
 
-Training takes 35:47 min (about 10 GB VRAM) and rendering a 1297x840 test view takes about 300 ms on an RTX 5090. For
-comparison, the official implementation takes about 5 hours to train this scene and renders at 0.1-0.2 FPS on an RTX 4090.
+On an RTX 5090, training takes 33:32 min for garden and 34:16 min for bicycle (about 10 GB VRAM), and rendering a
+1297x840 test view of garden takes about 310 ms. For comparison, the official implementation takes about 5 hours to
+train garden and renders at 0.1-0.2 FPS on an RTX 4090.
+
+
+## Acknowledgments
+
+This implementation builds on the following codebases:
+
+- [camp_zipnerf](https://github.com/jonbarron/camp_zipnerf): the official Zip-NeRF implementation, which this
+  implementation follows closely.
+- [instant-ngp](https://github.com/NVlabs/instant-ngp) and [tiny-cuda-nn](https://github.com/NVlabs/tiny-cuda-nn): the
+  multiresolution hash grid encoding and the mixed-precision accumulation of its gradients (fp16 atomics with a static
+  loss scale).
+- [efficient-gaussian-appearance](https://github.com/nerficg-project/efficient-gaussian-appearance): the structure of
+  the CUDA backend and the setup of the runtime-compiled kernels.

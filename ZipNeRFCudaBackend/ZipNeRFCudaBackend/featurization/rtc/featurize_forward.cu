@@ -1,5 +1,5 @@
 // forward featurization: one thread per interval computes the multisampled grid features and the given outputs
-// (raw density of the fused mlp, fp32 features, fp16 features, and the last columns of the NeRF MLP inputs); with
+// (raw density of the fused mlp, fp32 features, bf16 features, and the last columns of the NeRF MLP inputs); with
 // interleave, a warp processes the same interval of 32 consecutive rays, so the grid lookups of coherent rays mostly
 // hit the same cache sectors (this kernel is bound by L2 requests)
 
@@ -18,8 +18,8 @@ extern "C" __global__ void featurize_forward(
     const float* __restrict__ b1,
     float* __restrict__ raw_density,
     float* __restrict__ features_float,
-    uint16_t* __restrict__ features_half,
-    const int features_half_width,
+    uint16_t* __restrict__ features_bf16,
+    const int features_bf16_width,
     const uint16_t* __restrict__ encoded_directions,
     uint16_t* __restrict__ nerf_inputs,
     const int nerf_inputs_width,
@@ -71,17 +71,17 @@ extern "C" __global__ void featurize_forward(
         #pragma unroll
         for (uint32_t i = 0; i < n_output_features; i++) features_float[static_cast<uint64_t>(sample_idx) * n_output_features + i] = features[i];
     }
-    if (features_half != nullptr) {
-        uint16_t* out = features_half + static_cast<uint64_t>(sample_idx) * features_half_width;
+    if (features_bf16 != nullptr) {
+        uint16_t* out = features_bf16 + static_cast<uint64_t>(sample_idx) * features_bf16_width;
         #pragma unroll
-        for (uint32_t i = 0; i < n_output_features; i++) out[i] = float_to_half(features[i]);
-        for (uint32_t i = n_output_features; i < static_cast<uint32_t>(features_half_width); i++) out[i] = 0;
+        for (uint32_t i = 0; i < n_output_features; i++) out[i] = float_to_bf16(features[i]);
+        for (uint32_t i = n_output_features; i < static_cast<uint32_t>(features_bf16_width); i++) out[i] = 0;
     }
     if (nerf_inputs != nullptr) {
         // the first columns are the hidden features (written by the first GEMM), the last one is the bias lane
         const uint16_t* encoded = encoded_directions + static_cast<uint64_t>(sample_idx / n_intervals) * encoded_width;
         uint16_t* out = nerf_inputs + static_cast<uint64_t>(sample_idx + 1) * nerf_inputs_width - encoded_width;
         for (int i = 0; i < encoded_width - 1; i++) out[i] = encoded[i];
-        out[encoded_width - 1] = 0x3c00;  // fp16 1.0
+        out[encoded_width - 1] = 0x3f80;  // bf16 1.0
     }
 }

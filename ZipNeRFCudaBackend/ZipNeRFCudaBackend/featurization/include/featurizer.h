@@ -26,8 +26,11 @@ namespace zipnerf::featurization {
 
         int n_output_features() const { return m_n_levels * (m_n_features + 1); }
 
+        // table rows of the leading levels whose gradient backward accumulates in fp32
+        int64_t n_fp32_grad_rows() const { return m_level_offsets[m_n_fp32_grad_levels]; }
+
         // featurizes all intervals of tdist (random patterns for pattern_seed >= 0) and writes the given outputs (empty
-        // tensors are skipped): raw_density (requires the mlp weights), features_float, features_half (zero-padded), and
+        // tensors are skipped): raw_density (requires the mlp weights), features_float, features_bf16 (zero-padded), and
         // the encoded directions and bias lane in the last columns of nerf_inputs; interleave maps one interval of 32 rays to a warp
         void forward(
             const torch::Tensor& origins,
@@ -44,11 +47,12 @@ namespace zipnerf::featurization {
             const torch::Tensor& b1,
             torch::Tensor& raw_density,
             torch::Tensor& features_float,
-            torch::Tensor& features_half,
+            torch::Tensor& features_bf16,
             const torch::Tensor& encoded_directions,
             torch::Tensor& nerf_inputs);
 
-        // accumulates the grid gradient from fp16 feature gradients (scaled by the NeRF MLP gradient scale)
+        // accumulates the grid gradient (scaled by the NeRF grid gradient scale; fp32 for the first n_fp32_grad_rows rows,
+        // fp16 for the others) from bf16 feature gradients
         void backward(
             const torch::Tensor& origins,
             const torch::Tensor& directions,
@@ -56,7 +60,8 @@ namespace zipnerf::featurization {
             const torch::Tensor& tdist,
             int64_t pattern_seed,
             const torch::Tensor& grad_features,
-            torch::Tensor& grad_table);
+            torch::Tensor& grad_table,
+            torch::Tensor& grad_table_half);
 
         // accumulates the grid and mlp parameter gradients from the stored fp32 features and the raw density gradient
         void backward_mlp(
@@ -83,6 +88,7 @@ namespace zipnerf::featurization {
         int m_n_levels;
         int m_n_features;
         int m_mlp_width;
+        int m_n_fp32_grad_levels = 0;
         int m_n_sms;
         std::vector<int64_t> m_level_sizes, m_level_entries, m_level_offsets;
         std::unique_ptr<runtime::RtcKernel> m_forward_kernel, m_backward_kernel, m_backward_mlp_kernel;
