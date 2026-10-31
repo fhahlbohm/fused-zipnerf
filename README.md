@@ -102,7 +102,8 @@ As this implementation processes 65536 rays at once on a single GPU, the paper p
 
 The `MODEL` section defines the samples per level, the hash grids, and the MLP widths of the
 [official 360 config](https://github.com/jonbarron/camp_zipnerf/blob/main/configs/zipnerf/360.gin). In the `RENDERER` section, `RENDER_EXTRAS` additionally outputs the opacity and the depth during
-inference (off by default, as it slows down rendering).
+inference (off by default, as it slows down rendering). The depth is the expected depth as in the official code, or the
+median depth if `USE_MEDIAN_DEPTH` is enabled.
 
 
 ## Results

@@ -23,6 +23,7 @@ MODEL:
 RENDERER:
     RAY_BATCH_SIZE: 65_536  # rays per inference batch
     RENDER_EXTRAS: false  # if true, inference also outputs the opacity and the depth
+    USE_MEDIAN_DEPTH: false  # if true, the depth is the median depth instead of the expected depth
 TRAINING:
     LOAD_CHECKPOINT: null
     MODEL_NAME: zipnerf_garden

@@ -377,7 +377,8 @@ namespace zipnerf::sampling {
         float* __restrict__ alpha,
         float* __restrict__ depth,
         const int n_intervals,
-        const int n_rays)
+        const int n_rays,
+        const bool use_median_depth)
     {
         const int ray_idx = blockIdx.x * blockDim.x + threadIdx.x;
         if (ray_idx >= n_rays) return;
@@ -400,10 +401,26 @@ namespace zipnerf::sampling {
         rgb[3 * pixel + 2] = color.z + background_weight * background[2];
         if (alpha != nullptr) alpha[pixel] = acc;
         if (depth != nullptr) {
-            // expected log distance as in the official code, so that small weights far out do not dominate
-            float weighted_log_t = 0.0f;
-            for (int i = 0; i < n_intervals; i++) weighted_log_t += w[i] * logf(0.5f * (t[i] + t[i + 1]));
-            depth[pixel] = fminf(fmaxf(expf(weighted_log_t / fmaxf(acc, eps)), t[0]), t[n_intervals]);
+            if (use_median_depth) {
+                // start of the interval where the normalized weights reach one half, as interpolating within it is unbounded
+                // at silhouettes, whose background is covered by intervals that extend to the far plane
+                const float target = 0.5f * acc;
+                float cw = 0.0f, median = t[n_intervals];
+                for (int i = 0; i < n_intervals; i++) {
+                    cw += w[i];
+                    if (w[i] > 0.0f && cw >= target) {
+                        median = t[i];
+                        break;
+                    }
+                }
+                depth[pixel] = median;
+            }
+            else {
+                // expected log distance as in the official code, so that small weights far out do not dominate
+                float weighted_log_t = 0.0f;
+                for (int i = 0; i < n_intervals; i++) weighted_log_t += w[i] * logf(0.5f * (t[i] + t[i + 1]));
+                depth[pixel] = fminf(fmaxf(expf(weighted_log_t / fmaxf(acc, eps)), t[0]), t[n_intervals]);
+            }
         }
     }
 
@@ -638,7 +655,8 @@ namespace zipnerf::sampling {
         const torch::Tensor& pixel_indices,
         torch::Tensor& rgb,
         torch::Tensor& alpha,
-        torch::Tensor& depth)
+        torch::Tensor& depth,
+        const bool use_median_depth)
     {
         check_input(nerf_outputs, "nerf_outputs", torch::kHalf);
         check_input(tdist, "tdist", torch::kFloat);
@@ -657,7 +675,7 @@ namespace zipnerf::sampling {
             reinterpret_cast<const __half*>(nerf_outputs.data_ptr<torch::Half>()), tdist.data_ptr<float>(), directions.data_ptr<float>(),
             background.data_ptr<float>(), pixel_indices.data_ptr<int64_t>(), rgb.data_ptr<float>(),
             alpha.numel() > 0 ? alpha.data_ptr<float>() : nullptr, depth.numel() > 0 ? depth.data_ptr<float>() : nullptr,
-            n_intervals, n_rays);
+            n_intervals, n_rays, use_median_depth);
         C10_CUDA_KERNEL_LAUNCH_CHECK();
     }
 

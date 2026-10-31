@@ -55,7 +55,8 @@ namespace zipnerf::sampling {
         int next_level,
         const std::vector<double>& ray_warp);
 
-    // inference: color, opacity, and depth from the NeRF MLP outputs, written to the rays' pixels (empty buffers are skipped)
+    // inference: color, opacity, and expected or median depth from the NeRF MLP outputs, written to the rays' pixels
+    // (empty buffers are skipped)
     void composite_final_wrapper(
         const torch::Tensor& nerf_outputs,
         const torch::Tensor& tdist,
@@ -64,7 +65,8 @@ namespace zipnerf::sampling {
         const torch::Tensor& pixel_indices,
         torch::Tensor& rgb,
         torch::Tensor& alpha,
-        torch::Tensor& depth);
+        torch::Tensor& depth,
+        const bool use_median_depth);
 
     // training losses and their gradients w.r.t. the raw outputs of all levels: returns the NeRF MLP output gradient
     // (scaled by the NeRF MLP gradient scale), the proposal raw density gradients, and the loss sums if requested

@@ -17,6 +17,7 @@ from Visual.utils import apply_color_map
 @Framework.Configurable.configure(
     RAY_BATCH_SIZE=65_536,
     RENDER_EXTRAS=False,  # if True, inference also outputs the opacity and the depth
+    USE_MEDIAN_DEPTH=False,  # if True, the depth is the median depth instead of the expected depth
 )
 class ZipNeRFRenderer(BaseRenderer):
     """Renders ZipNeRF with runtime-compiled featurization kernels and fp16 cuBLASLt GEMMs for the NeRF MLP."""
@@ -114,7 +115,7 @@ class ZipNeRFRenderer(BaseRenderer):
             origins, directions, radii, tdist, -1, True, self.model.grids[-1].table, scale_magnitudes[-1], empty, empty, empty, empty,
             empty, empty, features, encoded_directions, inputs)
         outputs, _ = self.nerf_mlp.forward(features, inputs, nerf_weights, False)
-        composite_final(outputs, tdist, directions, background, pixel_indices, rgb, alpha, depth)
+        composite_final(outputs, tdist, directions, background, pixel_indices, rgb, alpha, depth, self.USE_MEDIAN_DEPTH)
 
     def pixel_order(self, width: int, height: int) -> torch.Tensor:
         """Returns the pixel indices in Morton order, so that each ray batch covers compact image tiles."""
