@@ -46,9 +46,14 @@ extern "C" __global__ void featurize_forward(
     if (thread_sample >= n_samples) return;
     uint32_t sample_idx = thread_sample;
     if (interleave) {
-        const uint32_t group = thread_sample / (32u * n_intervals), offset = thread_sample % (32u * n_intervals);
-        const uint32_t group_rays = min(32u, n_samples / n_intervals - 32u * group);
-        sample_idx = (32u * group + offset % group_rays) * n_intervals + offset / group_rays;
+#if __CUDA_ARCH__ == 1200 && JIT_MLP_WIDTH > 0
+        constexpr uint32_t interleave_rays = JIT_N_LEVELS <= 6 ? 128u : 64u;
+#else
+        constexpr uint32_t interleave_rays = 32u;
+#endif
+        const uint32_t group = thread_sample / (interleave_rays * n_intervals), offset = thread_sample % (interleave_rays * n_intervals);
+        const uint32_t group_rays = min(interleave_rays, n_samples / n_intervals - interleave_rays * group);
+        sample_idx = (interleave_rays * group + offset % group_rays) * n_intervals + offset / group_rays;
     }
 
     const RayInterval interval = setup_interval(origins, directions, radii, tdist, pattern_seed, sample_idx, n_intervals);

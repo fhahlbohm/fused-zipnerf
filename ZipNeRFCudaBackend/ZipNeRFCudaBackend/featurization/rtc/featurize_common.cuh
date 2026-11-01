@@ -116,12 +116,10 @@ namespace zipnerf {
         scale = multisample_scale * perp_mag * isoscale * (1.0f / grid_bbox_size);
     }
 
-    constexpr uint32_t max_level_corners = 8 * n_multisamples;
-
-    // table rows and weights (including the downweighting) of the corners of one level for all multisamples of an
-    // interval; multisamples in the same cell share corners, whose weights are merged to save lookups and atomics;
-    // returns the number of corners
-    __device__ inline uint32_t level_corners(const uint32_t level, const float3* x, const float* weighting, uint32_t* rows, float* weights) {
+    // Visit corners as soon as their merged weights are ready, without materializing up to 48 rows and weights per
+    // interval and level. Multisamples in the same cell still share lookups and atomics, in the original order.
+    template <typename Visitor>
+    __device__ __forceinline__ void visit_level_corners(const uint32_t level, const float3* x, const float* weighting, Visitor& visitor) {
         const uint32_t size = config::level_size(level);
         int cells[n_multisamples][3];
         float fractions[n_multisamples][3];
@@ -135,7 +133,7 @@ namespace zipnerf {
                 fractions[j][d] = p[d] - floored;
             }
         }
-        uint32_t n_corners = 0, merged = 0;
+        uint32_t merged = 0;
         #pragma unroll
         for (uint32_t j = 0; j < n_multisamples; j++) {
             if (merged & (1u << j)) continue;
@@ -168,13 +166,36 @@ namespace zipnerf {
                     if (!valid) weight = 0.0f;
                     index = valid ? static_cast<uint32_t>(ix + n * (iy + n * iz)) : 0u;
                 }
-                rows[n_corners] = config::level_offset(level) + index;
-                weights[n_corners] = weight;
-                n_corners++;
+                visitor(config::level_offset(level) + index, weight);
             }
         }
-        return n_corners;
     }
+
+    struct GatherFeatures {
+        const float* table;
+        float values[JIT_N_FEATURES];
+
+        __device__ __forceinline__ void operator()(const uint32_t row, const float weight) {
+            if (weight == 0.0f) return;
+            // vector loads for rows of 2 or 4 features (8 / 16 byte aligned)
+            if (JIT_N_FEATURES == 4) {
+                const float4 value = reinterpret_cast<const float4*>(table)[row];
+                values[0] += weight * value.x;
+                values[1 % JIT_N_FEATURES] += weight * value.y;
+                values[2 % JIT_N_FEATURES] += weight * value.z;
+                values[3 % JIT_N_FEATURES] += weight * value.w;
+            }
+            else if (JIT_N_FEATURES == 2) {
+                const float2 value = reinterpret_cast<const float2*>(table)[row];
+                values[0] += weight * value.x;
+                values[1 % JIT_N_FEATURES] += weight * value.y;
+            }
+            else {
+                #pragma unroll
+                for (uint32_t f = 0; f < JIT_N_FEATURES; f++) values[f] += weight * table[row * JIT_N_FEATURES + f];
+            }
+        }
+    };
 
     // downweighting of a level's features by the multisample's radius
     __device__ inline float level_weighting(const uint32_t level, const float scale) {
@@ -196,34 +217,10 @@ namespace zipnerf {
                 weighting[j] = level_weighting(level, scale[j]);
                 scale_feature += 2.0f * weighting[j] - 1.0f;
             }
-            uint32_t rows[max_level_corners];
-            float weights[max_level_corners];
-            const uint32_t n_corners = level_corners(level, x, weighting, rows, weights);
-            float level_features[JIT_N_FEATURES];
+            GatherFeatures gather = {table, {0.0f}};
+            visit_level_corners(level, x, weighting, gather);
             #pragma unroll
-            for (uint32_t f = 0; f < JIT_N_FEATURES; f++) level_features[f] = 0.0f;
-            for (uint32_t c = 0; c < n_corners; c++) {
-                if (weights[c] == 0.0f) continue;
-                // vector loads for rows of 2 or 4 features (8 / 16 byte aligned)
-                if (JIT_N_FEATURES == 4) {
-                    const float4 value = reinterpret_cast<const float4*>(table)[rows[c]];
-                    level_features[0] += weights[c] * value.x;
-                    level_features[1 % JIT_N_FEATURES] += weights[c] * value.y;
-                    level_features[2 % JIT_N_FEATURES] += weights[c] * value.z;
-                    level_features[3 % JIT_N_FEATURES] += weights[c] * value.w;
-                }
-                else if (JIT_N_FEATURES == 2) {
-                    const float2 value = reinterpret_cast<const float2*>(table)[rows[c]];
-                    level_features[0] += weights[c] * value.x;
-                    level_features[1 % JIT_N_FEATURES] += weights[c] * value.y;
-                }
-                else {
-                    #pragma unroll
-                    for (uint32_t f = 0; f < JIT_N_FEATURES; f++) level_features[f] += weights[c] * table[rows[c] * JIT_N_FEATURES + f];
-                }
-            }
-            #pragma unroll
-            for (uint32_t f = 0; f < JIT_N_FEATURES; f++) features[level * n_level_features + f] = feature_scale * level_features[f];
+            for (uint32_t f = 0; f < JIT_N_FEATURES; f++) features[level * n_level_features + f] = feature_scale * gather.values[f];
             features[level * n_level_features + JIT_N_FEATURES] = feature_scale * scale_feature * scale_magnitudes[level];
         }
     }
@@ -282,15 +279,13 @@ namespace zipnerf {
             float weighting[n_multisamples];
             #pragma unroll
             for (uint32_t j = 0; j < n_multisamples; j++) weighting[j] = level_weighting(level, scale[j]);
-            uint32_t rows[max_level_corners];
-            float weights[max_level_corners];
-            const uint32_t n_corners = level_corners(level, x, weighting, rows, weights);
             const float* g = grad_features + level * n_level_features;
-            for (uint32_t c = 0; c < n_corners; c++) {
-                if (weights[c] == 0.0f) continue;
-                if (level < n_fp32_levels) add_row_gradient(grad_table, rows[c], weights[c], g);
-                else add_row_gradient(grad_table_half, rows[c] - config::level_offset(n_fp32_levels), weights[c], g);
-            }
+            auto scatter = [&](const uint32_t row, const float weight) {
+                if (weight == 0.0f) return;
+                if (level < n_fp32_levels) add_row_gradient(grad_table, row, weight, g);
+                else add_row_gradient(grad_table_half, row - config::level_offset(n_fp32_levels), weight, g);
+            };
+            visit_level_corners(level, x, weighting, scatter);
         }
     }
 

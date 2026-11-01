@@ -91,7 +91,7 @@ namespace zipnerf::featurization {
         int m_n_fp32_grad_levels = 0;
         int m_n_sms;
         std::vector<int64_t> m_level_sizes, m_level_entries, m_level_offsets;
-        std::unique_ptr<runtime::RtcKernel> m_forward_kernel, m_backward_kernel, m_backward_mlp_kernel;
+        std::unique_ptr<runtime::RtcKernel> m_forward_kernel, m_forward_bf16_kernel, m_backward_kernel, m_backward_mlp_kernel;
     };
 
 }
