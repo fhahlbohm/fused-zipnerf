@@ -10,12 +10,13 @@ import json
 import math
 import os
 from pathlib import Path
+from types import ModuleType
 
 import torch
 from torch.utils.cpp_extension import load
 
 
-def load_backend(root, directory, name, fixed_heuristic=True):
+def load_backend(root: Path, directory: Path, name: str, fixed_heuristic: bool = True) -> ModuleType:
     backend = root / 'ZipNeRFCudaBackend' / 'ZipNeRFCudaBackend'
     directory.mkdir(parents=True, exist_ok=True)
     # Both libraries bind the same C++ types. Keep their Python registrations local.
@@ -51,7 +52,7 @@ def load_backend(root, directory, name, fixed_heuristic=True):
     return extension
 
 
-def difference(actual, reference):
+def difference(actual: torch.Tensor, reference: torch.Tensor) -> dict:
     a, b = actual.double(), reference.double()
     return {
         'exact': torch.equal(actual, reference),
@@ -60,7 +61,7 @@ def difference(actual, reference):
     }
 
 
-def check_gradients(actual, reference, repeat):
+def check_gradients(actual: torch.Tensor, reference: torch.Tensor, repeat: torch.Tensor) -> dict:
     result, noise = difference(actual, reference), difference(repeat, reference)
     assert torch.isfinite(actual).all().item()
     # FP16 atomics depend on warp arrival order. Preserve upstream's mixed split;
@@ -73,7 +74,7 @@ def check_gradients(actual, reference, repeat):
     return result | {'absolute_limit': absolute, 'relative_limit': relative, 'reference_noise': noise}
 
 
-def check_grids(extensions):
+def check_grids(extensions: dict[str, ModuleType]) -> list[dict]:
     result = []
     empty = torch.empty(0, device='cuda')
     for features in [1, 2, 3, 4]:
@@ -122,7 +123,7 @@ def check_grids(extensions):
     return result
 
 
-def check_proposals(extensions):
+def check_proposals(extensions: dict[str, ModuleType]) -> list[dict]:
     result = []
     empty = torch.empty(0, device='cuda')
     for levels in [6, 8]:
@@ -154,9 +155,9 @@ def check_proposals(extensions):
     return result
 
 
-def check_mlps(extensions):
+def check_mlps(extensions: dict[str, ModuleType]) -> list[dict]:
     result = []
-    for density, width, degree in [(64, 256, 4), (32, 256, 4), (64, 128, 4), (64, 256, 3)]:
+    for density, width, degree in [(64, 256, 4), (64, 128, 4), (32, 256, 4), (64, 192, 4), (64, 256, 3)]:
         shapes = extensions['baseline'].nerf_mlp_parameters(50, density, 256, width, degree)
         # Dyadic inputs limit reduction-order differences between independently
         # autotuned cuBLASLt handles while exercising signs, padding and ReLU.
@@ -168,8 +169,11 @@ def check_mlps(extensions):
             features = (torch.randint(-2, 3, (rows, 56), device='cuda').float() / 16).bfloat16()
             inputs = (torch.randint(-2, 3, (rows, models['baseline'].n_inputs), device='cuda').float() / 16).bfloat16()
             inputs[:, -1] = 1
-            saved = {n: m.forward(features, inputs.clone(), packed[n], False)[0] for n, m in models.items()}
-            torch.testing.assert_close(saved['candidate'], saved['baseline'], rtol=0, atol=0)
+            saved = {n: m.forward(features, inputs.clone(), packed[n], False) for n, m in models.items()}
+            torch.testing.assert_close(saved['candidate'][0], saved['baseline'][0], rtol=0, atol=0)
+            fused = (torch.cuda.get_device_capability() == (12, 0) and density == 64 and width in [128, 256]
+                     and degree == 4 and rows > 0 and rows % 64 == 0)
+            assert len(saved['candidate'][1]) == (0 if fused else 8)
         # Training must retain the original GEMM forward/backward path.
         features = (torch.randint(-2, 3, (64, 56), device='cuda').float() / 16).bfloat16()
         inputs = (torch.randint(-2, 3, (64, models['baseline'].n_inputs), device='cuda').float() / 16).bfloat16()
@@ -188,7 +192,7 @@ def check_mlps(extensions):
     return result
 
 
-def main():
+def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--baseline', type=Path, required=True)
     parser.add_argument('--build-directory', type=Path, default=Path('.cache/compare_backends'))
