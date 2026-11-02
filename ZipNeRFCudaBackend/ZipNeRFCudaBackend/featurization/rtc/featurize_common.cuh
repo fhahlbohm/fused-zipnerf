@@ -116,8 +116,9 @@ namespace zipnerf {
         scale = multisample_scale * perp_mag * isoscale * (1.0f / grid_bbox_size);
     }
 
-    // Visit corners as soon as their merged weights are ready, without materializing up to 48 rows and weights per
-    // interval and level. Multisamples in the same cell still share lookups and atomics, in the original order.
+    // passes the table rows and weights (including the downweighting) of the corners of one level for all multisamples
+    // of an interval to the visitor; multisamples in the same cell share corners, whose weights are merged to save
+    // lookups and atomics
     template <typename Visitor>
     __device__ __forceinline__ void visit_level_corners(const uint32_t level, const float3* x, const float* weighting, Visitor& visitor) {
         const uint32_t size = config::level_size(level);

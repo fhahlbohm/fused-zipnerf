@@ -1,7 +1,8 @@
 // forward featurization: one thread per interval computes the multisampled grid features and the given outputs
 // (raw density of the fused mlp, fp32 features, bf16 features, and the last columns of the NeRF MLP inputs); with
-// interleave, a warp processes the same interval of 32 consecutive rays, so the grid lookups of coherent rays mostly
-// hit the same cache sectors (this kernel is bound by L2 requests)
+// interleave, consecutive threads process the same interval of consecutive rays in groups of 32 rays (64 or 128 for
+// the proposal grids on sm_120), so the grid lookups of coherent rays mostly hit the same cache sectors (this kernel is
+// bound by L2 requests)
 
 extern "C" __global__ void featurize_forward(
     const float3* __restrict__ origins,
