@@ -107,6 +107,10 @@ The `MODEL` section defines the samples per level, the hash grids, and the MLP w
 inference (off by default, as it slows down rendering). The depth is the expected depth as in the official code, or the
 median depth if `USE_MEDIAN_DEPTH` is enabled.
 
+To train a smaller, 128-wide view-dependent MLP, change `MODEL.MLP_VIEW_WIDTH` in `zipnerf_garden.yaml`. The smaller
+model can affect image quality but is faster to train and render. On SM120, both widths use the fused bf16 inference
+kernel for supported layouts; training and other layouts use cuBLASLt.
+
 
 ## Results
 

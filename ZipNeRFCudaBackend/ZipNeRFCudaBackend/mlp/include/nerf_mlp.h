@@ -50,7 +50,7 @@ namespace zipnerf::mlp {
         // folds the fp32 parameters into the packed bf16 weights
         torch::Tensor pack(const torch::Tensor& params) const;
 
-        // returns the bf16 outputs and the context of the backward (relu masks are only stored when training)
+        // returns the bf16 outputs and backward context (empty for fused inference)
         std::tuple<torch::Tensor, std::vector<torch::Tensor>> forward(
             const torch::Tensor& features,
             torch::Tensor& inputs,
@@ -68,6 +68,7 @@ namespace zipnerf::mlp {
             torch::Tensor& grad_params) const;
 
     private:
+        bool m_fused_inference = false;
         Layout m_layout;
     };
 

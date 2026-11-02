@@ -135,7 +135,12 @@ namespace zipnerf::featurization {
             if (nerf_inputs.size(0) != n_samples || nerf_inputs.size(1) < encoded_directions.size(1)) throw std::runtime_error("ZipNeRF: invalid nerf_inputs");
         }
         if (n_samples == 0) return;
-        kernel(m_forward_kernel, "featurize_forward").launch(
+        const bool packed = m_mlp_width == 0 && features_float.numel() == 0 && features_bf16.numel() > 0
+            && features_bf16.size(1) % 8 == 0 && reinterpret_cast<uintptr_t>(features_bf16.data_ptr()) % 16 == 0
+            && (nerf_inputs.numel() == 0 || (nerf_inputs.size(1) % 8 == 0 && encoded_directions.size(1) % 8 == 0
+                && reinterpret_cast<uintptr_t>(nerf_inputs.data_ptr()) % 16 == 0
+                && reinterpret_cast<uintptr_t>(encoded_directions.data_ptr()) % 16 == 0));
+        kernel(packed ? m_forward_bf16_kernel : m_forward_kernel, packed ? "featurize_forward_bf16" : "featurize_forward").launch(
             n_blocks(n_samples), config::block_size, 0, c10::cuda::getCurrentCUDAStream(),
             reinterpret_cast<const float3*>(origins.data_ptr<float>()),
             reinterpret_cast<const float3*>(directions.data_ptr<float>()),
