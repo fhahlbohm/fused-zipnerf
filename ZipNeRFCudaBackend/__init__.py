@@ -12,10 +12,12 @@ __install_command__ = [
 
 try:
     from .ZipNeRFCudaBackend.torch_bindings.pipeline import grid_max_value, nerf_grid_grad_scale, Featurizer, nerf_mlp_parameters, NerfMlp, Adam, \
-        generate_rays, view_rays, view_rays_cached, initialize_rays, sample_uniforms, composite_and_resample, resample_inference, train_final, composite_final
+        generate_rays, view_rays, view_rays_cached, initialize_rays, sample_uniforms, composite_and_resample, resample_inference, train_final, composite_final, \
+        proposal_grid_points, sample_proposal_grid
     __all__ = [
         'grid_max_value', 'nerf_grid_grad_scale', 'Featurizer', 'nerf_mlp_parameters', 'NerfMlp', 'Adam', 'generate_rays', 'view_rays', 'initialize_rays',
         'sample_uniforms', 'composite_and_resample', 'train_final', 'composite_final', 'view_rays_cached', 'resample_inference',
+        'proposal_grid_points', 'sample_proposal_grid',
     ]
     # set up runtime compilation (the featurization kernels are read from the source tree, compiled kernels are cached)
     from ZipNeRFCudaBackend import _C

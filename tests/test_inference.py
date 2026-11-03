@@ -126,6 +126,66 @@ class InferenceTests(unittest.TestCase):
             with self.subTest(samples=samples), self.assertRaises(RuntimeError):
                 self.backend.resample_inference(raw, sdist, sdist, local, samples, self.warp)
 
+    def test_proposal_grid_points(self) -> None:
+        reference = torch.empty(0, device='cuda')
+        resolution = 16
+        points = self.backend.proposal_grid_points(reference, resolution, 0, resolution ** 3)
+        norm = points.square().sum(dim=-1, keepdim=True).sqrt().clamp_min(1)
+        contracted = points * (2 * norm - 1) / norm.square()
+        index = torch.arange(resolution ** 3, device='cuda')
+        cells = torch.stack([index % resolution, index // resolution % resolution, index // resolution ** 2], dim=-1)
+        expected = 4 * ((cells.float() + 0.5) / resolution - 0.5)
+        radius = expected.square().sum(dim=-1, keepdim=True).sqrt()
+        expected *= radius.clamp_max(2 - 1.e-5) / radius
+        torch.testing.assert_close(contracted, expected, rtol=1.e-5, atol=1.e-5)
+        self.assert_exact(self.backend.proposal_grid_points(reference, resolution, 17, 31), points[17:48])
+        self.assertEqual(tuple(self.backend.proposal_grid_points(reference, resolution, 0, 0).shape), (0, 3))
+
+    def test_proposal_grid_sampling(self) -> None:
+        levels = [torch.full((size, size, size), 3.0, device='cuda') for size in [16, 8, 4, 2, 1]]
+        for rays in [0, 1, 7, 37, 65]:
+            origins = torch.randn(rays, 3, device='cuda') * 100
+            directions = torch.randn_like(origins)
+            if rays:
+                directions[0] = torch.tensor([0.0, 0.0, 1.0], device='cuda')
+            radii = torch.rand(rays, device='cuda') * 10
+            for intervals in [1, 3, 64]:
+                with self.subTest(rays=rays, intervals=intervals):
+                    tdist = torch.linspace(0.1, 100, intervals + 1, device='cuda')[None].repeat(rays, 1)
+                    raw = torch.empty(rays, intervals, device='cuda')
+                    self.backend.sample_proposal_grid(levels, origins, directions, radii, tdist, raw)
+                    torch.testing.assert_close(raw, torch.full_like(raw, math.log(3) + 1), rtol=1.e-6, atol=1.e-6)
+        # an affine density field checks axis order, half-cell offsets and interpolation independently
+        axis = (torch.arange(16, device='cuda') + 0.5) / 16
+        z, y, x = torch.meshgrid(axis, axis, axis, indexing='ij')
+        table = (1 + x + 2 * y + 3 * z).contiguous()
+        origins = torch.tensor([[0.2, 0.1, -0.3], [-0.6, 0.2, 0.1], [0.0, 0.0, 0.0]], device='cuda')
+        directions = torch.zeros_like(origins)
+        directions[:, 2] = 1
+        radii = torch.zeros(3, device='cuda')
+        tdist = torch.zeros(3, 6, device='cuda')
+        raw = torch.empty(3, 5, device='cuda')
+        self.backend.sample_proposal_grid([table], origins, directions, radii, tdist, raw)
+        density = 1 + ((origins * 0.25 + 0.5) * torch.tensor([1, 2, 3], device='cuda')).sum(dim=-1)
+        expected = (density.log() + 1)[:, None].expand_as(raw)
+        torch.testing.assert_close(raw, expected, rtol=1.e-6, atol=1.e-6)
+
+    def test_invalid_proposal_grids(self) -> None:
+        reference = torch.empty(0, device='cuda')
+        for resolution, start, count in [(3, 0, 1), (2048, 0, 1), (16, -1, 1), (16, 4096, 1), (16, 0, -1)]:
+            with self.subTest(resolution=resolution, start=start, count=count), self.assertRaises(RuntimeError):
+                self.backend.proposal_grid_points(reference, resolution, start, count)
+        origins = torch.zeros(1, 3, device='cuda')
+        directions = torch.ones_like(origins)
+        radii = torch.zeros(1, device='cuda')
+        tdist = torch.zeros(1, 3, device='cuda')
+        raw = torch.empty(1, 2, device='cuda')
+        for levels in [[], [torch.zeros(4, 4, device='cuda')],
+                [torch.zeros(4, 4, 4, device='cuda'), torch.zeros(1, 1, 1, device='cuda')],
+                [torch.zeros(4, 4, 4, device='cuda', dtype=torch.float16)]]:
+            with self.assertRaises(RuntimeError):
+                self.backend.sample_proposal_grid(levels, origins, directions, radii, tdist, raw)
+
 
 if __name__ == '__main__':
     unittest.main()

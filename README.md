@@ -112,6 +112,16 @@ median depth if `USE_MEDIAN_DEPTH` is enabled.
 Set it to `False` to use the original inference path with the same checkpoint. The optimized path preserves the
 model, sample counts and antialiasing; training uses the original forward and backward kernels.
 
+For a trained model, `RENDERER.USE_CACHED_PROPOSALS=True` optionally replaces the proposal networks with FP32 density
+grids and mipmaps. `PROPOSAL_GRID_RESOLUTION` defaults to 1024; the two mip pyramids add approximately 9.14 GiB of GPU
+memory. They are built on first use, rebuilt when proposal parameters or the resolution change, and released when
+the option is disabled. The final NeRF field, sample counts and six-point antialiasing remain unchanged.
+
+This is an approximation: interpolated point densities differ from evaluating the proposal networks on averaged
+features. Low-opacity or nonfinite cached rays are rendered again with native proposals; `PROPOSAL_OPACITY_THRESHOLD`
+defaults to 0.995. This recovers tested coverage holes but does not detect every possible cache error. Native proposals
+remain the default for exact rendering, and training always uses the original proposal networks.
+
 To train a smaller, 128-wide view-dependent MLP, change `MODEL.MLP_VIEW_WIDTH` in `zipnerf_garden.yaml`. The smaller
 model can affect image quality but is faster to train and render. On SM120, both widths use the fused bf16 inference
 kernel for supported layouts; training and other layouts use cuBLASLt.
