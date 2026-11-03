@@ -10,7 +10,8 @@ from Methods.Base.Model import BaseModel
 from Methods.Base.Renderer import BaseRenderer
 from Methods.ZipNeRF.Model import ZipNeRFModel
 from Methods.ZipNeRF.utils import pixel_radius
-from Methods.ZipNeRF.ZipNeRFCudaBackend import Featurizer, NerfMlp, view_rays, composite_and_resample, composite_final
+from Methods.ZipNeRF.ZipNeRFCudaBackend import Featurizer, NerfMlp, view_rays, view_rays_cached, initialize_rays, \
+    composite_and_resample, resample_inference, composite_final
 from Visual.utils import apply_color_map
 
 
@@ -18,6 +19,7 @@ from Visual.utils import apply_color_map
     RAY_BATCH_SIZE=65_536,
     RENDER_EXTRAS=False,  # if True, inference also outputs the opacity and the depth
     USE_MEDIAN_DEPTH=False,  # if True, the depth is the median depth instead of the expected depth
+    USE_FAST_INFERENCE=True,  # exact inference kernels; training uses the original sampling and MLP paths
 )
 class ZipNeRFRenderer(BaseRenderer):
     """Renders ZipNeRF with runtime-compiled featurization kernels and bf16 cuBLASLt GEMMs for the NeRF MLP."""
@@ -28,6 +30,7 @@ class ZipNeRFRenderer(BaseRenderer):
         self.pixel_order_indices: torch.Tensor | None = None
         self.packed_weights: torch.Tensor | None = None
         self.packed_iteration = -1
+        self.initial_intervals: dict[tuple[int, int, int, tuple[float, ...]], tuple[torch.Tensor, torch.Tensor]] = {}
         # the NeRF level's density MLP is part of the NeRF MLP
         self.featurizers = [
             Featurizer(level, grid.sizes, grid.level_entries, grid.n_features_per_level, self.model.MLP_DENSITY_WIDTH if level < len(self.model.grids) - 1 else 0)
@@ -107,14 +110,20 @@ class ZipNeRFRenderer(BaseRenderer):
             featurizer.forward(
                 origins, directions, radii, tdist, -1, True, self.model.grids[level].table, scale_magnitudes[level], *self.model.proposal_mlp(level),
                 raw_density, empty, empty, empty, empty)
-            _, sdist, tdist = composite_and_resample(raw_density, sdist, tdist, directions, 1.0, n_samples[level + 1], -1, level + 1, warp)
+            if self.USE_FAST_INFERENCE:
+                sdist, tdist = resample_inference(raw_density, sdist, tdist, directions, n_samples[level + 1], warp)
+            else:
+                _, sdist, tdist = composite_and_resample(raw_density, sdist, tdist, directions, 1.0, n_samples[level + 1], -1, level + 1, warp)
         n_final = n_rays * n_samples[-1]
         features = torch.empty(n_final, self.nerf_mlp.n_features, dtype=torch.bfloat16)
-        inputs = torch.empty(n_final, self.nerf_mlp.n_inputs, dtype=torch.bfloat16)
+        inputs = empty if self.USE_FAST_INFERENCE else torch.empty(n_final, self.nerf_mlp.n_inputs, dtype=torch.bfloat16)
         self.featurizers[-1].forward(
             origins, directions, radii, tdist, -1, True, self.model.grids[-1].table, scale_magnitudes[-1], empty, empty, empty, empty,
-            empty, empty, features, encoded_directions, inputs)
-        outputs, _ = self.nerf_mlp.forward(features, inputs, nerf_weights, False)
+            empty, empty, features, empty if self.USE_FAST_INFERENCE else encoded_directions, inputs)
+        if self.USE_FAST_INFERENCE:
+            outputs = self.nerf_mlp.forward_rays(features, encoded_directions, nerf_weights, n_samples[-1])
+        else:
+            outputs, _ = self.nerf_mlp.forward(features, inputs, nerf_weights, False)
         composite_final(outputs, tdist, directions, background, pixel_indices, rgb, alpha, depth, self.USE_MEDIAN_DEPTH)
 
     def pixel_order(self, width: int, height: int) -> torch.Tensor:
@@ -147,6 +156,13 @@ class ZipNeRFRenderer(BaseRenderer):
         warp = self.model.ray_warp(camera.near_plane, camera.far_plane)
         background = camera.background_color.to(local_directions.device)
         scale_magnitudes, nerf_weights = self.model.level_scale_magnitudes(), self.nerf_weights()
+        if self.USE_FAST_INFERENCE:
+            # keep initialization and reuse on the same device and stream
+            key = (local_directions.device.index, torch.cuda.current_stream(local_directions.device).cuda_stream, self.model.N_SAMPLES[0], warp)
+            if key not in self.initial_intervals:
+                direction = torch.tensor([[0.0, 0.0, 1.0]], device=local_directions.device)
+                _, sdist, tdist = initialize_rays(-1, direction, self.model.DIRECTION_ENCODING_DEGREE, self.model.N_SAMPLES[0], warp)
+                self.initial_intervals[key] = (sdist, tdist)
         n_pixels = camera.width * camera.height
         empty = torch.empty(0)
         outputs = {'rgb': torch.empty(n_pixels, 3)}
@@ -154,7 +170,10 @@ class ZipNeRFRenderer(BaseRenderer):
             outputs |= {'alpha': torch.empty(n_pixels, 1), 'depth': torch.empty(n_pixels, 1)}
         for start in range(0, n_pixels, self.RAY_BATCH_SIZE):
             pixel_indices = order[start:start + self.RAY_BATCH_SIZE]
-            rays = view_rays(pixel_indices, local_directions, c2w, radius, self.model.DIRECTION_ENCODING_DEGREE, self.model.N_SAMPLES[0], warp)
+            if self.USE_FAST_INFERENCE:
+                rays = view_rays_cached(pixel_indices, local_directions, c2w, radius, self.model.DIRECTION_ENCODING_DEGREE, *self.initial_intervals[key])
+            else:
+                rays = view_rays(pixel_indices, local_directions, c2w, radius, self.model.DIRECTION_ENCODING_DEGREE, self.model.N_SAMPLES[0], warp)
             self.render_rays_inference(
                 rays, camera.near_plane, camera.far_plane, background, scale_magnitudes, nerf_weights, pixel_indices,
                 outputs['rgb'], outputs.get('alpha', empty), outputs.get('depth', empty))

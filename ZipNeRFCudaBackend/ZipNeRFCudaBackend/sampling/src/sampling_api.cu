@@ -146,6 +146,58 @@ namespace zipnerf::sampling {
             encoded_directions + ray_idx * config::direction_block_width(direction_degree), sdist + ray_idx * (n_samples + 1), tdist + ray_idx * (n_samples + 1));
     }
 
+    // inference: encode camera directions once per ray, with packed stores for degree four
+    template <bool Packed>
+    __global__ void view_rays_cached_kernel(
+        const int64_t* pixel_indices, const float* local_directions, const float* c2w,
+        const float radius, float* origins, float* directions, float* radii,
+        __nv_bfloat16* encoded_directions, const int degree, const int n_rays)
+    {
+        const int direction_degree = Packed ? 4 : degree;
+        const int ray = blockIdx.x * blockDim.x + threadIdx.x;
+        if (ray >= n_rays) return;
+        const float3 d = world_direction(c2w, load_float3(local_directions, pixel_indices[ray]));
+        origins[3 * ray] = c2w[3];
+        origins[3 * ray + 1] = c2w[7];
+        origins[3 * ray + 2] = c2w[11];
+        directions[3 * ray] = d.x;
+        directions[3 * ray + 1] = d.y;
+        directions[3 * ray + 2] = d.z;
+        radii[ray] = radius;
+        const float inv_norm = 1.0f / norm3(d);
+        const float v[3] = {d.x * inv_norm, d.y * inv_norm, d.z * inv_norm};
+        union DirectionBits { __nv_bfloat16 values[32]; uint4 vectors[4]; } bits;
+        auto* encoded = Packed ? bits.values : encoded_directions + ray * config::direction_block_width(direction_degree);
+        #pragma unroll
+        for (int i = 0; i < config::direction_block_width(direction_degree); i++) encoded[i] = __float2bfloat16(0.0f);
+        #pragma unroll
+        for (int c = 0; c < 3; c++) {
+            encoded[c] = __float2bfloat16(v[c]);
+            #pragma unroll
+            for (int k = 0; k < direction_degree; k++) {
+                float sin_value, cos_value;
+                sincosf(scalbnf(v[c], k), &sin_value, &cos_value);
+                encoded[3 + 3 * k + c] = __float2bfloat16(sin_value);
+                encoded[3 + 3 * (direction_degree + k) + c] = __float2bfloat16(cos_value);
+            }
+        }
+        if constexpr (Packed) {
+            #pragma unroll
+            for (int i = 0; i < 4; i++) reinterpret_cast<uint4*>(encoded_directions + ray * 32)[i] = bits.vectors[i];
+        }
+    }
+
+    // centered first-level intervals are identical for every ray
+    __global__ void broadcast_distances_kernel(const float* source_s, const float* source_t,
+        float* sdist, float* tdist, const int64_t count, const int columns)
+    {
+        const int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+        if (i < count) {
+            sdist[i] = source_s[i % columns];
+            tdist[i] = source_t[i % columns];
+        }
+    }
+
     // initialization of given rays, with random jitter for seed >= 0 (as generate_rays) and centered samples otherwise
     __global__ void initialize_rays_kernel(
         const int64_t seed,
@@ -226,6 +278,69 @@ namespace zipnerf::sampling {
             const bool clipped = raw[i] - 1.0f > max_density_exponent;
             grad[i] = clipped ? 0.0f : grad[i] * (t[i + 1] - t[i]) * direction_norm * density[i];
         }
+    }
+
+    // one warp cooperatively stages the intervals of 32 neighboring rays
+    __global__ void resample_coalesced_kernel(
+        const float* raw, const float* sdist, const float* tdist, const float* directions,
+        float* next_s, float* next_t, const int intervals, const int samples, const RayWarp warp, const int rays)
+    {
+        constexpr int stride = max_intervals + 1;
+        __shared__ float shared[32 * stride];
+        const int lane = threadIdx.x;
+        const int first = blockIdx.x * 32, ray = first + lane;
+        float density[max_intervals], weights[max_intervals];
+
+        for (int i = lane; i < 32 * intervals; i += 32) {
+            const int row = i / intervals, column = i % intervals;
+            shared[row * stride + column] = first + row < rays ? raw[first * intervals + i] : 0.0f;
+        }
+        __syncwarp();
+        if (ray < rays) {
+            for (int i = 0; i < intervals; i++) density[i] = activate_density(shared[lane * stride + i]);
+        }
+        __syncwarp();
+        for (int i = lane; i < 32 * stride; i += 32) {
+            shared[i] = first + i / stride < rays ? tdist[first * stride + i] : 0.0f;
+        }
+        __syncwarp();
+        if (ray < rays) {
+            composite(density, shared + lane * stride, intervals, norm3(load_float3(directions, ray)), weights, nullptr);
+        }
+        __syncwarp();
+        for (int i = lane; i < 32 * stride; i += 32) {
+            shared[i] = first + i / stride < rays ? sdist[first * stride + i] : 0.0f;
+        }
+        __syncwarp();
+        // sample_intervals computes all centers before writing any endpoints,
+        // so its input/output may share this ray's disjoint shared-memory row.
+        if (ray < rays) sample_intervals(shared + lane * stride, weights,
+            intervals, 1.0f, samples, -1.0f, shared + lane * stride);
+        __syncwarp();
+        for (int i = lane; i < 32 * (samples + 1); i += 32) {
+            const int row = i / (samples + 1), column = i % (samples + 1);
+            if (first + row < rays) {
+                const float value = shared[row * stride + column];
+                next_s[first * (samples + 1) + i] = value;
+                next_t[first * (samples + 1) + i] = s_to_t(value, warp);
+            }
+        }
+    }
+
+    // inference retains proposal weights locally; only the next intervals are written
+    __global__ void resample_inference_kernel(
+        const float* raw_density, const float* sdist, const float* tdist, const float* directions,
+        float* sdist_next, float* tdist_next, const int n_intervals, const int n_samples,
+        const RayWarp warp, const int n_rays)
+    {
+        const int ray = blockIdx.x * blockDim.x + threadIdx.x;
+        if (ray >= n_rays) return;
+        float density[max_intervals], weights[max_intervals];
+        for (int i = 0; i < n_intervals; i++) density[i] = activate_density(raw_density[ray * n_intervals + i]);
+        composite(density, tdist + ray * (n_intervals + 1), n_intervals, norm3(load_float3(directions, ray)), weights, nullptr);
+        float* next = sdist_next + ray * (n_samples + 1);
+        sample_intervals(sdist + ray * (n_intervals + 1), weights, n_intervals, 1.0f, n_samples, -1.0f, next);
+        for (int i = 0; i <= n_samples; i++) tdist_next[ray * (n_samples + 1) + i] = s_to_t(next[i], warp);
     }
 
     __global__ void train_final_kernel(
@@ -519,6 +634,47 @@ namespace zipnerf::sampling {
         return {origins, directions, radii, encoded_directions, sdist, tdist};
     }
 
+    std::vector<torch::Tensor> view_rays_cached_wrapper(
+        const torch::Tensor& pixels, const torch::Tensor& local_directions, const torch::Tensor& c2w,
+        const double radius, const int degree, const torch::Tensor& source_s, const torch::Tensor& source_t)
+    {
+        check_input(pixels, "pixels", torch::kLong);
+        check_input(local_directions, "local_directions", torch::kFloat);
+        check_input(c2w, "c2w", torch::kFloat);
+        check_input(source_s, "source_s", torch::kFloat);
+        check_input(source_t, "source_t", torch::kFloat);
+        const int rays = static_cast<int>(pixels.numel()), columns = static_cast<int>(source_s.numel());
+        check_n_intervals(columns - 1);
+        if (source_s.sizes() != source_t.sizes() || source_s.dim() != 2 || source_s.size(0) != 1 || c2w.numel() != 12
+            || local_directions.dim() != 2 || local_directions.size(1) != 3
+            || pixels.device() != local_directions.device() || c2w.device() != local_directions.device()
+            || source_s.device() != local_directions.device() || source_t.device() != local_directions.device()) {
+            throw std::runtime_error("ZipNeRF: invalid initial intervals");
+        }
+        auto origins = torch::empty({rays, 3}, local_directions.options());
+        auto directions = torch::empty_like(origins);
+        auto radii = torch::empty({rays}, local_directions.options());
+        auto encoded = torch::empty({rays, config::direction_block_width(degree)}, local_directions.options().dtype(torch::kBFloat16));
+        auto sdist = torch::empty({rays, columns}, local_directions.options());
+        auto tdist = torch::empty_like(sdist);
+        const auto stream = c10::cuda::getCurrentCUDAStream();
+        if (rays) {
+            if (degree == 4) {
+                view_rays_cached_kernel<true><<<n_blocks(rays), block_size, 0, stream>>>(pixels.data_ptr<int64_t>(), local_directions.data_ptr<float>(),
+                c2w.data_ptr<float>(), static_cast<float>(radius), origins.data_ptr<float>(), directions.data_ptr<float>(), radii.data_ptr<float>(),
+                reinterpret_cast<__nv_bfloat16*>(encoded.data_ptr<torch::BFloat16>()), degree, rays);
+            } else {
+                view_rays_cached_kernel<false><<<n_blocks(rays), block_size, 0, stream>>>(pixels.data_ptr<int64_t>(), local_directions.data_ptr<float>(),
+                c2w.data_ptr<float>(), static_cast<float>(radius), origins.data_ptr<float>(), directions.data_ptr<float>(), radii.data_ptr<float>(),
+                reinterpret_cast<__nv_bfloat16*>(encoded.data_ptr<torch::BFloat16>()), degree, rays);
+            }
+            broadcast_distances_kernel<<<n_blocks(sdist.numel()), block_size, 0, stream>>>(source_s.data_ptr<float>(), source_t.data_ptr<float>(),
+                sdist.data_ptr<float>(), tdist.data_ptr<float>(), sdist.numel(), columns);
+            C10_CUDA_KERNEL_LAUNCH_CHECK();
+        }
+        return {origins, directions, radii, encoded, sdist, tdist};
+    }
+
     std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> initialize_rays_wrapper(
         const int64_t seed,
         const torch::Tensor& directions,
@@ -578,6 +734,41 @@ namespace zipnerf::sampling {
             n_intervals, static_cast<float>(anneal), n_samples, seed, next_level, make_ray_warp(ray_warp), n_rays);
         C10_CUDA_KERNEL_LAUNCH_CHECK();
         return {weights, sdist_next, tdist_next};
+    }
+
+    std::tuple<torch::Tensor, torch::Tensor> resample_inference_wrapper(
+        const torch::Tensor& raw_density, const torch::Tensor& sdist, const torch::Tensor& tdist,
+        const torch::Tensor& directions, const int n_samples, const std::vector<double>& ray_warp)
+    {
+        check_input(raw_density, "raw_density", torch::kFloat);
+        check_input(sdist, "sdist", torch::kFloat);
+        check_input(tdist, "tdist", torch::kFloat);
+        check_input(directions, "directions", torch::kFloat);
+        check_n_intervals(n_samples);
+        if (raw_density.dim() != 2 || sdist.dim() != 2 || directions.dim() != 2)
+            throw std::runtime_error("ZipNeRF: invalid inference interval dimensions");
+        const int n_rays = static_cast<int>(raw_density.size(0)), n_intervals = static_cast<int>(raw_density.size(1));
+        check_n_intervals(n_intervals);
+        if (sdist.sizes() != tdist.sizes() || sdist.size(0) != n_rays || sdist.size(1) != n_intervals + 1
+            || directions.size(0) != n_rays || directions.size(1) != 3 || sdist.device() != raw_density.device()
+            || tdist.device() != raw_density.device() || directions.device() != raw_density.device())
+            throw std::runtime_error("ZipNeRF: invalid inference interval shape or device");
+        torch::Tensor next_s = torch::empty({n_rays, n_samples + 1}, raw_density.options());
+        torch::Tensor next_t = torch::empty_like(next_s);
+        if (n_rays > 0) {
+            const auto stream = c10::cuda::getCurrentCUDAStream();
+            if (n_intervals == 64 && (n_samples == 32 || n_samples == 64)) {
+                resample_coalesced_kernel<<<(n_rays + 31) / 32, 32, 0, stream>>>(
+                    raw_density.data_ptr<float>(), sdist.data_ptr<float>(), tdist.data_ptr<float>(), directions.data_ptr<float>(),
+                    next_s.data_ptr<float>(), next_t.data_ptr<float>(), n_intervals, n_samples, make_ray_warp(ray_warp), n_rays);
+            } else {
+                resample_inference_kernel<<<n_blocks(n_rays), block_size, 0, stream>>>(
+                    raw_density.data_ptr<float>(), sdist.data_ptr<float>(), tdist.data_ptr<float>(), directions.data_ptr<float>(),
+                    next_s.data_ptr<float>(), next_t.data_ptr<float>(), n_intervals, n_samples, make_ray_warp(ray_warp), n_rays);
+            }
+            C10_CUDA_KERNEL_LAUNCH_CHECK();
+        }
+        return {next_s, next_t};
     }
 
     std::tuple<torch::Tensor, std::vector<torch::Tensor>, torch::Tensor> train_final_wrapper(

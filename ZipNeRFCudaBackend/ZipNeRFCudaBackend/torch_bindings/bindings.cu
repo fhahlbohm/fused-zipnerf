@@ -27,6 +27,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         .def_property_readonly("n_inputs", &mlp_api::NerfMlp::n_inputs)
         .def("pack", &mlp_api::NerfMlp::pack)
         .def("forward", &mlp_api::NerfMlp::forward)
+        .def("forward_rays", &mlp_api::NerfMlp::forward_rays)
         .def("backward", &mlp_api::NerfMlp::backward);
     py::class_<optimizer_api::Adam>(m, "Adam")
         .def(py::init<const std::vector<torch::Tensor>&, const std::vector<torch::Tensor>&, const std::vector<double>&,
@@ -35,6 +36,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         .def("regularization", &optimizer_api::Adam::regularization);
     m.def("generate_rays", &sampling_api::generate_rays_wrapper);
     m.def("view_rays", &sampling_api::view_rays_wrapper);
+    m.def("view_rays_cached", &sampling_api::view_rays_cached_wrapper);
+    m.def("resample_inference", &sampling_api::resample_inference_wrapper);
     m.def("initialize_rays", &sampling_api::initialize_rays_wrapper);
     m.def("sample_uniforms", &sampling_api::sample_uniforms_wrapper);
     m.def("composite_and_resample", &sampling_api::composite_and_resample_wrapper);

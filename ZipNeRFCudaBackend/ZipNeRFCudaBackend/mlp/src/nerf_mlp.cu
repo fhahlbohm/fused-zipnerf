@@ -304,6 +304,14 @@ namespace zipnerf::mlp {
 
     static unsigned int n_blocks(const int64_t n) { return static_cast<unsigned int>((n + block_size - 1) / block_size); }
 
+    __device__ __forceinline__ void load_a_matrix(const __nv_bfloat16* pointer,
+        uint32_t& a0, uint32_t& a1, uint32_t& a2, uint32_t& a3)
+    {
+        const uint32_t address = static_cast<uint32_t>(__cvta_generic_to_shared(pointer));
+        asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];"
+            : "=r"(a0), "=r"(a1), "=r"(a2), "=r"(a3) : "r"(address));
+    }
+
     constexpr int fused_view_samples = 64;
     constexpr int fused_view_threads = 256;
 
@@ -331,11 +339,9 @@ namespace zipnerf::mlp {
                 }
                 #pragma unroll
                 for (int m = 0; m < fused_view_samples / 16; m++) {
-                    const __nv_bfloat16* ap = input + (m * 16 + row) * Stride + k + k_lane;
-                    const uint32_t a0 = *reinterpret_cast<const uint32_t*>(ap);
-                    const uint32_t a1 = *reinterpret_cast<const uint32_t*>(ap + 8 * Stride);
-                    const uint32_t a2 = *reinterpret_cast<const uint32_t*>(ap + 8);
-                    const uint32_t a3 = *reinterpret_cast<const uint32_t*>(ap + 8 * Stride + 8);
+                    uint32_t a0, a1, a2, a3;
+                    const __nv_bfloat16* ap = input + (m * 16 + lane % 16) * Stride + k + (lane / 16) * 8;
+                    load_a_matrix(ap, a0, a1, a2, a3);
                     #pragma unroll
                     for (int n = 0; n < nt; n++) {
                         asm volatile(
@@ -369,22 +375,119 @@ namespace zipnerf::mlp {
 #endif
     }
 
-    template <int Inputs, bool AddRgb, int Stride>
+    // two K32 weight tiles overlap copies with MMA; XOR addresses avoid padding
+    constexpr int fused_weight_tile = 32;
+
+    template <int Stride, bool Swizzled>
+    __device__ __forceinline__ int activation_offset(const int sample, const int column) {
+        return sample * Stride + (Swizzled ? ((column / 8) ^ (sample & 7)) * 8 + column % 8 : column);
+    }
+
+    template <int Inputs, int Outputs>
+    __device__ __forceinline__ void load_weight_slab(
+        __nv_bfloat16* staged, const __nv_bfloat16* weights, const int base)
+    {
+        for (int i = threadIdx.x; i < Outputs * fused_weight_tile / 8; i += fused_view_threads) {
+            const int output = i / (fused_weight_tile / 8), column = base + (i % (fused_weight_tile / 8)) * 8;
+            const int mask = (output >> 1) & 3;
+            const int destination_index = output * (fused_weight_tile / 8) + ((i % (fused_weight_tile / 8)) ^ mask);
+            const int valid = column < Inputs ? 16 : 0;
+            const auto* source = column < Inputs ? weights + output * Inputs + column : weights;
+            const uint32_t destination = static_cast<uint32_t>(__cvta_generic_to_shared(reinterpret_cast<uint4*>(staged) + destination_index));
+            asm volatile("cp.async.ca.shared.global [%0], [%1], 16, %2;" :: "r"(destination), "l"(source), "r"(valid) : "memory");
+        }
+        asm volatile("cp.async.commit_group;" ::: "memory");
+    }
+
+    template <int Inputs, int Outputs, int Stride, int Samples = fused_view_samples>
+    __device__ __forceinline__ void staged_dense_layer(
+        const __nv_bfloat16* input, const __nv_bfloat16* weights, const __nv_bfloat16* bias, __nv_bfloat16* hidden)
+    {
+#if __CUDA_ARCH__ >= 800
+        __nv_bfloat16* staged = hidden + Samples * Stride;
+        load_weight_slab<Inputs, Outputs>(staged, weights, 0);
+        asm volatile("cp.async.wait_group 0;" ::: "memory");
+        __syncthreads();
+        const int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
+        const int row = lane / 4, k_lane = (lane % 4) * 2;
+        constexpr int nt = Outputs <= 128 ? 2 : 4;
+        float c[Samples / 16][nt][4] = {};
+        #pragma unroll
+        for (int base = 0; base < Inputs; base += fused_weight_tile) {
+            const int slot = (base / fused_weight_tile) % 2;
+            if (base + fused_weight_tile < Inputs) {
+                load_weight_slab<Inputs, Outputs>(staged + (1 - slot) * Outputs * fused_weight_tile, weights, base + fused_weight_tile);
+            }
+            if (warp < Outputs / (nt * 8)) {
+                #pragma unroll
+                for (int offset = 0; offset < fused_weight_tile && base + offset < Inputs; offset += 16) {
+                    const int k = base + offset;
+                    uint32_t b[nt][2];
+                    #pragma unroll
+                    for (int n = 0; n < nt; n++) {
+                        const int output = warp * nt * 8 + n * 8 + lane % 8;
+                        const int mask = (output >> 1) & 3;
+                        const int chunk = (offset / 8 + ((lane / 8) % 2)) ^ mask;
+                        const __nv_bfloat16* wp = staged + slot * Outputs * fused_weight_tile
+                            + output * fused_weight_tile + chunk * 8;
+                        const uint32_t address = static_cast<uint32_t>(__cvta_generic_to_shared(wp));
+                        asm volatile("ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0,%1}, [%2];"
+                            : "=r"(b[n][0]), "=r"(b[n][1]) : "r"(address));
+                    }
+                    #pragma unroll
+                    for (int m = 0; m < Samples / 16; m++) {
+                        uint32_t a0, a1, a2, a3;
+                        const __nv_bfloat16* ap = input + activation_offset<Stride, true>(m * 16 + lane % 16, k + (lane / 16) * 8);
+                        load_a_matrix(ap, a0, a1, a2, a3);
+                        #pragma unroll
+                        for (int n = 0; n < nt; n++) {
+                            asm volatile(
+                                "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
+                                "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+                                : "+f"(c[m][n][0]), "+f"(c[m][n][1]), "+f"(c[m][n][2]), "+f"(c[m][n][3])
+                                : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b[n][0]), "r"(b[n][1]));
+                        }
+                    }
+                }
+            }
+            asm volatile("cp.async.wait_group 0;" ::: "memory");
+            __syncthreads();
+        }
+        if (warp < Outputs / (nt * 8)) {
+            #pragma unroll
+            for (int n = 0; n < nt; n++) {
+                const int col = warp * nt * 8 + n * 8 + k_lane;
+                const float bias0 = bias != nullptr ? __bfloat162float(bias[col]) : 0.0f;
+                const float bias1 = bias != nullptr ? __bfloat162float(bias[col + 1]) : 0.0f;
+                #pragma unroll
+                for (int m = 0; m < Samples / 16; m++) {
+                    #pragma unroll
+                    for (int r = 0; r < 2; r++) {
+                        *reinterpret_cast<__nv_bfloat162*>(hidden + activation_offset<Stride, true>(m * 16 + row + r * 8, col)) = __floats2bfloat162_rn(
+                            fmaxf(c[m][n][r * 2] + bias0, 0.0f),
+                            fmaxf(c[m][n][r * 2 + 1] + bias1, 0.0f));
+                    }
+                }
+            }
+        }
+        __syncthreads();
+#endif
+    }
+
+    template <int Inputs, bool AddRgb, int Stride, bool Swizzle = false, int Samples = fused_view_samples>
     __device__ __forceinline__ void direct_projection(
         const __nv_bfloat16* input, const __nv_bfloat16* weights, __nv_bfloat16* outputs)
     {
 #if __CUDA_ARCH__ >= 800
         const int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
-        if (warp >= fused_view_samples / 16) return;
+        if (warp >= Samples / 16) return;
         const int row = lane / 4, col = (lane % 4) * 2;
         float c[4] = {};
         #pragma unroll
         for (int k = 0; k < Inputs; k += 16) {
-            const __nv_bfloat16* ap = input + (warp * 16 + row) * Stride + k + col;
-            const uint32_t a0 = *reinterpret_cast<const uint32_t*>(ap);
-            const uint32_t a1 = *reinterpret_cast<const uint32_t*>(ap + 8 * Stride);
-            const uint32_t a2 = *reinterpret_cast<const uint32_t*>(ap + 8);
-            const uint32_t a3 = *reinterpret_cast<const uint32_t*>(ap + 8 * Stride + 8);
+            uint32_t a0, a1, a2, a3;
+            const __nv_bfloat16* ap = input + activation_offset<Stride, Swizzle>(warp * 16 + lane % 16, k + (lane / 16) * 8);
+            load_a_matrix(ap, a0, a1, a2, a3);
             const __nv_bfloat16* wp = weights + row * Inputs + k + col;
             const uint32_t b0 = *reinterpret_cast<const uint32_t*>(wp);
             const uint32_t b1 = *reinterpret_cast<const uint32_t*>(wp + 8);
@@ -434,6 +537,37 @@ namespace zipnerf::mlp {
         direct_dense_layer<ViewWidth, ViewWidth, stride>(hidden, packed + layout.weights[w_1], packed + layout.weights[b_1], hidden);
         direct_dense_layer<ViewWidth, ViewWidth, stride>(hidden, packed + layout.weights[w_2], packed + layout.weights[b_2], hidden);
         direct_projection<ViewWidth, true, stride>(hidden, packed + layout.weights[w_rgb], outputs + first * n_outputs);
+#endif
+    }
+
+    template <int ViewWidth, int Samples = fused_view_samples>
+    __global__ void __launch_bounds__(fused_view_threads, 2) complete_mlp_rays_kernel(
+        const __nv_bfloat16* __restrict__ features, const __nv_bfloat16* __restrict__ encoded,
+        const __nv_bfloat16* __restrict__ packed, const Layout layout, __nv_bfloat16* __restrict__ outputs, const int n_intervals)
+    {
+#if __CUDA_ARCH__ >= 800
+        constexpr int stride = ViewWidth;
+        extern __shared__ __align__(32) __nv_bfloat16 hidden[];
+        const int64_t first = static_cast<int64_t>(blockIdx.x) * Samples;
+        for (int i = threadIdx.x; i < Samples * 8; i += fused_view_threads) {
+            *reinterpret_cast<uint4*>(hidden + activation_offset<stride, true>(i / 8, (i % 8) * 8)) = i % 8 < 7
+                ? reinterpret_cast<const uint4*>(features + (first + i / 8) * 56)[i % 8] : make_uint4(0, 0, 0, 0);
+        }
+        for (int i = threadIdx.x; i < Samples * 4; i += fused_view_threads) {
+            const int64_t ray = (first + i / 4) / n_intervals;
+            uint4 value = reinterpret_cast<const uint4*>(encoded + ray * 32)[i % 4];
+            // the final BF16 lane is the exact 1.0 bias
+            if (i % 4 == 3) value.w = (value.w & 0x0000ffffu) | 0x3f800000u;
+            *reinterpret_cast<uint4*>(hidden + activation_offset<stride, true>(i / 4, 64 + (i % 4) * 8)) = value;
+        }
+        __syncthreads();
+        staged_dense_layer<56, 64, stride, Samples>(hidden, packed + layout.weights[w_density], packed + layout.weights[b_density], hidden);
+        direct_projection<96, false, stride, true, Samples>(hidden, packed + layout.weights[w_skip], outputs + first * n_outputs);
+        __syncthreads();
+        staged_dense_layer<96, ViewWidth, stride, Samples>(hidden, packed + layout.weights[w_combined], nullptr, hidden);
+        staged_dense_layer<ViewWidth, ViewWidth, stride, Samples>(hidden, packed + layout.weights[w_1], packed + layout.weights[b_1], hidden);
+        staged_dense_layer<ViewWidth, ViewWidth, stride, Samples>(hidden, packed + layout.weights[w_2], packed + layout.weights[b_2], hidden);
+        direct_projection<ViewWidth, true, stride, true, Samples>(hidden, packed + layout.weights[w_rgb], outputs + first * n_outputs);
 #endif
     }
 
@@ -560,6 +694,71 @@ namespace zipnerf::mlp {
         std::vector<torch::Tensor> context = {inputs, v0, v1, v2};
         context.insert(context.end(), masks.begin(), masks.end());
         return {outputs, context};
+    }
+
+    __global__ void expand_ray_directions_kernel(
+        const __nv_bfloat16* encoded, __nv_bfloat16* inputs,
+        const int64_t n, const int width, const int encoded_width, const int n_intervals)
+    {
+        const int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+        if (idx >= n * encoded_width) return;
+        const int64_t sample = idx / encoded_width;
+        const int column = idx % encoded_width;
+        inputs[sample * width + width - encoded_width + column] = column == encoded_width - 1
+            ? __float2bfloat16(1.0f) : encoded[(sample / n_intervals) * encoded_width + column];
+    }
+
+    torch::Tensor NerfMlp::forward_rays(
+        const torch::Tensor& features, const torch::Tensor& encoded,
+        const torch::Tensor& packed, const int64_t n_intervals) const
+    {
+        check_input(features, "features", torch::kBFloat16);
+        check_input(encoded, "encoded", torch::kBFloat16);
+        check_input(packed, "packed", torch::kBFloat16);
+        const int64_t n = features.size(0);
+        const int encoded_width = m_layout.n_inputs - m_layout.density_width;
+        if (features.dim() != 2 || features.size(1) != m_layout.n_features || encoded.dim() != 2
+            || encoded.size(1) != encoded_width || n_intervals <= 0 || encoded.size(0) * n_intervals != n
+            || packed.numel() != m_layout.weights[n_weights]
+            || features.device() != encoded.device() || features.device() != packed.device()) {
+            throw std::runtime_error("ZipNeRF: invalid per-ray MLP inputs");
+        }
+        const cudaStream_t stream = c10::cuda::getCurrentCUDAStream();
+        if (m_fused_inference && m_layout.view_width == 128 && n > 0 && n % fused_view_samples == 0
+            && reinterpret_cast<uintptr_t>(features.data_ptr()) % 16 == 0
+            && reinterpret_cast<uintptr_t>(encoded.data_ptr()) % 16 == 0
+            && reinterpret_cast<uintptr_t>(packed.data_ptr()) % 16 == 0) {
+            torch::Tensor outputs = torch::empty({n, n_outputs}, features.options());
+            // larger tiles amortize weight staging; other eligible batches use the 64-row path
+            const int tile_samples = n % 128 == 0 ? 128 : fused_view_samples;
+            const unsigned int blocks = static_cast<unsigned int>(n / tile_samples);
+            const int shared_bytes = (tile_samples * m_layout.view_width + 2 * m_layout.view_width * fused_weight_tile) * sizeof(__nv_bfloat16);
+            if (tile_samples == 128) {
+                C10_CUDA_CHECK(cudaFuncSetAttribute(complete_mlp_rays_kernel<128, 128>, cudaFuncAttributeMaxDynamicSharedMemorySize, shared_bytes));
+                complete_mlp_rays_kernel<128, 128><<<blocks, fused_view_threads, shared_bytes, stream>>>(
+                    static_cast<const __nv_bfloat16*>(features.data_ptr()), static_cast<const __nv_bfloat16*>(encoded.data_ptr()),
+                    static_cast<const __nv_bfloat16*>(packed.data_ptr()), m_layout,
+                    static_cast<__nv_bfloat16*>(outputs.data_ptr()), static_cast<int>(n_intervals));
+            }
+            else {
+                C10_CUDA_CHECK(cudaFuncSetAttribute(complete_mlp_rays_kernel<128>, cudaFuncAttributeMaxDynamicSharedMemorySize, shared_bytes));
+                complete_mlp_rays_kernel<128><<<blocks, fused_view_threads, shared_bytes, stream>>>(
+                    static_cast<const __nv_bfloat16*>(features.data_ptr()), static_cast<const __nv_bfloat16*>(encoded.data_ptr()),
+                    static_cast<const __nv_bfloat16*>(packed.data_ptr()), m_layout,
+                    static_cast<__nv_bfloat16*>(outputs.data_ptr()), static_cast<int>(n_intervals));
+            }
+            C10_CUDA_KERNEL_LAUNCH_CHECK();
+            return outputs;
+        }
+        // preserve the original inference path for partial tiles and other layouts
+        torch::Tensor inputs = torch::empty({n, m_layout.n_inputs}, features.options());
+        if (n > 0) {
+            expand_ray_directions_kernel<<<n_blocks(n * encoded_width), block_size, 0, stream>>>(
+                static_cast<const __nv_bfloat16*>(encoded.data_ptr()), static_cast<__nv_bfloat16*>(inputs.data_ptr()),
+                n, m_layout.n_inputs, encoded_width, static_cast<int>(n_intervals));
+            C10_CUDA_KERNEL_LAUNCH_CHECK();
+        }
+        return std::get<0>(forward(features, inputs, packed, false));
     }
 
     torch::Tensor NerfMlp::backward(
