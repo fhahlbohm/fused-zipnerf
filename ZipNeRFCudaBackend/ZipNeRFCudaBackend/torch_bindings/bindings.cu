@@ -1,5 +1,6 @@
 #include <torch/extension.h>
 #include "featurizer.h"
+#include "proposal_grid.h"
 #include "sampling_api.h"
 #include "optimizer_api.h"
 #include "nerf_mlp.h"
@@ -14,6 +15,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.attr("grid_max_value") = zipnerf::config::hash_init_range / zipnerf::config::precondition_scaling;
     m.attr("nerf_grid_grad_scale") = zipnerf::config::nerf_grid_grad_scale;
     m.def("set_rtc_dirs", &featurization_api::set_rtc_dirs);
+    m.def("proposal_grid_points", &featurization_api::proposal_grid_points_wrapper);
+    m.def("sample_proposal_grid", &featurization_api::sample_proposal_grid_wrapper);
     py::class_<featurization_api::Featurizer>(m, "Featurizer")
         .def(py::init<int, const std::vector<int64_t>&, const std::vector<int64_t>&, int, int>())
         .def_property_readonly("n_fp32_grad_rows", &featurization_api::Featurizer::n_fp32_grad_rows)
@@ -27,6 +30,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         .def_property_readonly("n_inputs", &mlp_api::NerfMlp::n_inputs)
         .def("pack", &mlp_api::NerfMlp::pack)
         .def("forward", &mlp_api::NerfMlp::forward)
+        .def("forward_rays", &mlp_api::NerfMlp::forward_rays)
         .def("backward", &mlp_api::NerfMlp::backward);
     py::class_<optimizer_api::Adam>(m, "Adam")
         .def(py::init<const std::vector<torch::Tensor>&, const std::vector<torch::Tensor>&, const std::vector<double>&,
@@ -35,6 +39,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         .def("regularization", &optimizer_api::Adam::regularization);
     m.def("generate_rays", &sampling_api::generate_rays_wrapper);
     m.def("view_rays", &sampling_api::view_rays_wrapper);
+    m.def("view_rays_cached", &sampling_api::view_rays_cached_wrapper);
+    m.def("resample_inference", &sampling_api::resample_inference_wrapper);
     m.def("initialize_rays", &sampling_api::initialize_rays_wrapper);
     m.def("sample_uniforms", &sampling_api::sample_uniforms_wrapper);
     m.def("composite_and_resample", &sampling_api::composite_and_resample_wrapper);

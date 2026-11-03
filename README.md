@@ -44,8 +44,9 @@ JAX/autograd pipeline with hand-written CUDA kernels and analytic gradients, wit
 - **Optimizer** (`optimizer/`): a single-launch Adam over all parameter buffers that also applies the grid
   regularizer and updates the magnitudes of the hash grids' scale features.
 
-Inference uses the same kernels with deterministic sampling. Rays are processed in Morton order and each warp handles
-the same interval of 32 neighboring rays, so their grid lookups mostly hit the same cache lines.
+Inference uses deterministic sampling. Rays are processed in Morton order and each warp handles the same interval
+of 32 neighboring rays, so their grid lookups mostly hit the same cache lines. The inference path reuses direction
+encodings and initial intervals per ray, and keeps intermediate proposal weights local to the sampling kernels.
 
 
 ## Installation
@@ -106,6 +107,20 @@ The `MODEL` section defines the samples per level, the hash grids, and the MLP w
 [official 360 config](https://github.com/jonbarron/camp_zipnerf/blob/main/configs/zipnerf/360.gin). In the `RENDERER` section, `RENDER_EXTRAS` additionally outputs the opacity and the depth during
 inference (off by default, as it slows down rendering). The depth is the expected depth as in the official code, or the
 median depth if `USE_MEDIAN_DEPTH` is enabled.
+
+`RENDERER.USE_FAST_INFERENCE` enables the inference-specific camera, resampling and MLP kernels (default `True`).
+Set it to `False` to use the original inference path with the same checkpoint. The optimized path preserves the
+model, sample counts and antialiasing; training uses the original forward and backward kernels.
+
+For a trained model, `RENDERER.USE_CACHED_PROPOSALS=True` optionally replaces the proposal networks with FP32 density
+grids and mipmaps. `PROPOSAL_GRID_RESOLUTION` defaults to 1024; the two mip pyramids add approximately 9.14 GiB of GPU
+memory. They are built on first use, rebuilt when proposal parameters or the resolution change, and released when
+the option is disabled. The final NeRF field, sample counts and six-point antialiasing remain unchanged.
+
+This is an approximation: interpolated point densities differ from evaluating the proposal networks on averaged
+features. Low-opacity or nonfinite cached rays are rendered again with native proposals; `PROPOSAL_OPACITY_THRESHOLD`
+defaults to 0.995. This recovers tested coverage holes but does not detect every possible cache error. Native proposals
+remain the default for exact rendering, and training always uses the original proposal networks.
 
 To train a smaller, 128-wide view-dependent MLP, change `MODEL.MLP_VIEW_WIDTH` in `zipnerf_garden.yaml`. The smaller
 model can affect image quality but is faster to train and render. On SM120, both widths use the fused bf16 inference

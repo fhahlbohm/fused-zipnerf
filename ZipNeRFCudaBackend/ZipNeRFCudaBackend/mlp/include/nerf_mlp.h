@@ -57,6 +57,11 @@ namespace zipnerf::mlp {
             const torch::Tensor& packed,
             bool training) const;
 
+        // inference with one encoded direction row per ray, shared across its intervals
+        torch::Tensor forward_rays(
+            const torch::Tensor& features, const torch::Tensor& encoded,
+            const torch::Tensor& packed, int64_t n_intervals) const;
+
         // backward from the bf16 output gradient: accumulates the gradients of the fp32 parameters into grad_params and
         // returns the bf16 feature gradient
         torch::Tensor backward(
